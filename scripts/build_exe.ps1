@@ -4,16 +4,43 @@ $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root "dist"
 $work = Join-Path $root "build"
 $spec = Join-Path $root "build_spec"
+$icon = Join-Path $root "assets\ALF_Scan_Viewer.ico"
 
 & (Join-Path $root "scripts\install_runtime.ps1")
 python -m pip install pyinstaller
 
+$pyinstallerArgs = @(
+    "--noconfirm",
+    "--clean",
+    "--windowed",
+    "--onefile",
+    "--name", "ALF Scan Viewer",
+    "--distpath", $dist,
+    "--workpath", $work,
+    "--specpath", $spec,
+    "--collect-all", "open3d"
+)
+
+if (Test-Path -LiteralPath $icon) {
+    $pyinstallerArgs += @("--icon", $icon)
+} else {
+    Write-Warning "Icon not found at $icon. Build will use the default Windows icon."
+}
+
+$pyinstallerArgs += (Join-Path $root "run_viewer.py")
+
+python -m PyInstaller @pyinstallerArgs
+
+<#
+Legacy expanded command, equivalent to the argument list above:
 python -m PyInstaller --noconfirm --clean --windowed --onefile `
     --name "ALF Scan Viewer" `
     --distpath $dist `
     --workpath $work `
     --specpath $spec `
+    --icon $icon `
     --collect-all open3d `
     (Join-Path $root "run_viewer.py")
+#>
 
 Write-Host "Built viewer:" (Join-Path $dist "ALF Scan Viewer.exe")

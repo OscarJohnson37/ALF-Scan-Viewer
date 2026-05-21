@@ -6,36 +6,83 @@ Standalone viewer for ALF Surface Scanner outputs.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime.ps1
-python -m alf_scan_viewer "C:\path\to\gridmap.npz"
+python -m alf_scan_viewer "C:\path\to\ALF Project"
 ```
 
 You can also use the root runner:
 
 ```powershell
-python run_viewer.py "C:\path\to\gridmap.npz"
+python run_viewer.py "C:\path\to\ALF Project"
 ```
 
-You can open:
+You can open either:
 
-- ALF gridmaps as `.npz` files with a matching `.json` sidecar
-- `.ply` geometry files
-- point cloud files supported by Open3D: `.pcd`, `.pts`, `.xyz`, `.xyzn`, `.xyzrgb`
+- an ALF project folder
+- the project's `data\tools\surface_scanner` folder
 
-For gridmaps, the viewer reads `mean` as height and `rgb` as color, then shows
-the scan as one colored 3D point set. There are no separate display modes yet.
+The viewer lists Surface Scanner milestones from that folder. When a raw
+`.npz` gridmap exists, the viewer renders from that so the live controls apply.
+Processed `*_surface_mesh.ply` files are used as a fallback when no raw gridmap
+is available.
+
+The side panel uses expandable sections:
+
+- `Project`: choose selected/stacked view, pick a milestone, or manually refresh
+- `Surface`: choose scanner RGB, height jet gradient, signed deformation, or
+  absolute deformation colouring; optionally switch scalar colouring to binary
+  red/green with a threshold in millimetres and invert toggle; signed
+  deformation gradients can also be inverted to choose whether up or down is
+  red; set downsampling
+- `Z Axis`: render actual mean height, signed deformation, absolute deformation,
+  or flat
+- `Section`: optionally limit rendering to an X and/or Y coordinate range
+- `Stack`: choose which raw-gridmap milestones are included and set the
+  vertical offset between them in stacked view
+- `Camera`: rotate with the mouse, apply a preset view, and export the current
+  camera view as a Surface Scanner graph PNG
+- `Info`: show the loaded files, baseline, and stack order
+
+Changing these controls refreshes the view automatically. Stack separation uses
+the cached stack, so dragging it should feel continuous.
+
+Exported camera views are written to:
+
+```text
+data\tools\surface_scanner\graphs\3d_surface_views
+```
+
+The export uses the current rendered Open3D camera, so a manually rotated view is
+saved exactly as shown.
+
+The baseline dropdown defaults to the ALF shared milestone marked with
+`post_bedding_baseline` when that metadata exists. Boundary/material marker
+lines are possible in the Open3D scene, but need a project metadata source or
+manual boundary editor before they can be drawn reliably.
 
 ## Open Directly From A File
 
-The app accepts a file path as its first argument:
+The app accepts a project or Surface Scanner folder as its first argument:
 
 ```powershell
-python -m alf_scan_viewer "C:\path\to\surface_mesh.ply"
+python -m alf_scan_viewer "C:\path\to\Project\data\tools\surface_scanner"
 ```
 
-When packaged as an executable, this same argument contract is what Windows file
-associations or the ALF Tool Kit launcher should use.
+Direct file opening still works as a fallback for `.npz`, `.ply`, `.pcd`,
+`.pts`, `.xyz`, `.xyzn`, and `.xyzrgb`, but the main workflow is milestone
+selection from a project directory.
 
 ## Build A Windows Exe
+
+Put the app icon at:
+
+```text
+assets\ALF_Scan_Viewer.ico
+```
+
+Use an `.ico` file for the Windows executable icon. If your source artwork is a
+`.jpg`, convert/export it to `ALF_Scan_Viewer.ico` first. The build script passes
+that icon to PyInstaller, which gives the exe its icon and is also what Windows
+uses for the app window icon.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
