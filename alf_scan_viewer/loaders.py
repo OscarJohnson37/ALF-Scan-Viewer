@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 import json
+import warnings
 
 import numpy as np
 
@@ -11,12 +12,28 @@ import numpy as np
 GRIDMAP_EXTENSIONS = {".npz"}
 GEOMETRY_EXTENSIONS = {".ply", ".pcd", ".pts", ".xyz", ".xyzn", ".xyzrgb"}
 SUPPORTED_EXTENSIONS = GRIDMAP_EXTENSIONS | GEOMETRY_EXTENSIONS
+GRID_ARRAY_MODE_PREFIX = "array:"
+_VARIANCE_ARRAY_KEYS = ("variance", "var")
+_COUNT_ARRAY_KEYS = ("count", "counts", "sample_count", "n")
+_CONFIDENCE_ARRAY_KEYS = ("confidence", "mean_confidence", "measurement_confidence")
+_VISUAL_VARIANCE_REFERENCE_PERCENTILE = 75.0
+_VISUAL_COUNT_REFERENCE_PERCENTILE = 50.0
+_VISUAL_VARIANCE_CONFIDENCE_POWER = 2.0
+_VISUAL_COUNT_CONFIDENCE_POWER = 0.5
+_VISUAL_LOW_CONFIDENCE = 0.4
+_VISUAL_VERY_LOW_CONFIDENCE = 0.15
+_VISUAL_OUTLIER_MAD_FACTOR = 3.0
+_VISUAL_OUTLIER_RADIUS = 2
+_VISUAL_INPAINT_ITERATIONS = 20
+_VISUAL_FALLBACK_RADII = (3, 5, 7, 10, 15, 20)
+_VISUAL_DONOR_WEIGHT_POWER = 4.0
 
 
 @dataclass(frozen=True)
 class GridmapData:
     mean_grid: np.ndarray
     rgb_grid: np.ndarray | None
+    scalar_grids: dict[str, np.ndarray]
     x_centres: np.ndarray
     y_centres: np.ndarray
     source_path: Path
@@ -30,7 +47,9 @@ class GridmapSurface:
     source_path: Path
     downsample_step: int
     color_by: str
+    color_source: str
     z_by: str
+    z_source: str
     z_scale: float
     color_binary: bool = False
     color_threshold: float = 0.0
@@ -59,6 +78,10 @@ def require_supported_path(path: Path) -> Path:
     return path
 
 
+def gridmap_scalar_array_keys(path: Path) -> list[str]:
+    return list(load_gridmap_data(path).scalar_grids)
+
+
 def load_gridmap_data(path: Path) -> GridmapData:
     path = require_supported_path(path)
     if path.suffix.lower() not in GRIDMAP_EXTENSIONS:
@@ -74,6 +97,13 @@ def load_gridmap_data(path: Path) -> GridmapData:
             raise KeyError(f"Gridmap requires a 'mean' array. Available: {available}")
         mean_grid = np.asarray(data["mean"], dtype=float)
         rgb_grid = np.asarray(data["rgb"], dtype=float) if "rgb" in data else None
+        scalar_grids = _scalar_grids_from_npz(data, mean_grid=mean_grid)
+    scalar_grids.update(
+        _processed_measurement_scalar_grids(path, expected_shape=mean_grid.shape)
+    )
+    scalar_grids.update(
+        _processed_weighted_spline_scalar_grids(path, expected_shape=mean_grid.shape)
+    )
 
     metadata = _normalise_gridmap_metadata(
         json.loads(sidecar_path.read_text(encoding="utf-8")),
@@ -83,6 +113,7 @@ def load_gridmap_data(path: Path) -> GridmapData:
     return GridmapData(
         mean_grid=mean_grid,
         rgb_grid=rgb_grid,
+        scalar_grids=scalar_grids,
         x_centres=x_centres,
         y_centres=y_centres,
         source_path=path,
@@ -94,10 +125,12 @@ def load_gridmap_surface(
     *,
     downsample_step: int = 1,
     color_by: str = "rgb",
+    color_source: str | None = None,
     color_binary: bool = False,
     color_threshold: float = 0.0,
     color_invert: bool = False,
-    z_by: str = "mean",
+    z_by: str = "height",
+    z_source: str | None = None,
     z_scale: float = 1.0,
     baseline_path: Path | None = None,
     baseline_data: GridmapData | None = None,
@@ -111,10 +144,12 @@ def load_gridmap_surface(
         gridmap,
         downsample_step=downsample_step,
         color_by=color_by,
+        color_source=color_source,
         color_binary=color_binary,
         color_threshold=color_threshold,
         color_invert=color_invert,
         z_by=z_by,
+        z_source=z_source,
         z_scale=z_scale,
         baseline_data=baseline_data,
         x_range=x_range,
@@ -127,39 +162,50 @@ def build_gridmap_surface(
     *,
     downsample_step: int = 1,
     color_by: str = "rgb",
+    color_source: str | None = None,
     color_binary: bool = False,
     color_threshold: float = 0.0,
     color_invert: bool = False,
-    z_by: str = "mean",
+    z_by: str = "height",
+    z_source: str | None = None,
     z_scale: float = 1.0,
     baseline_data: GridmapData | None = None,
     x_range: tuple[float | None, float | None] | None = None,
     y_range: tuple[float | None, float | None] | None = None,
 ) -> GridmapSurface:
     downsample_step = _normalise_downsample_step(downsample_step)
-    color_by = _normalise_color_by(color_by)
+    raw_color_by = color_by
+    raw_z_by = z_by
+    color_by = _normalise_color_by(raw_color_by)
+    color_source = _normalise_scalar_source(
+        color_source,
+        fallback=_legacy_color_source(raw_color_by),
+    )
     color_threshold = _normalise_z_scale(color_threshold)
-    z_by = _normalise_z_by(z_by)
+    z_by = _normalise_z_by(raw_z_by)
+    z_source = _normalise_scalar_source(
+        z_source,
+        fallback=_legacy_z_source(raw_z_by),
+    )
     z_scale = _normalise_z_scale(z_scale)
     x_range = _normalise_axis_range(x_range)
     y_range = _normalise_axis_range(y_range)
 
-    mean_grid = gridmap.mean_grid
+    mean_grid = gridmap.mean_grid[::downsample_step, ::downsample_step]
     rgb_grid = gridmap.rgb_grid
-    x_centres = gridmap.x_centres
-    y_centres = gridmap.y_centres
+    x_centres = gridmap.x_centres[::downsample_step]
+    y_centres = gridmap.y_centres[::downsample_step]
 
-    mean_grid = mean_grid[::downsample_step, ::downsample_step]
-    x_centres = x_centres[::downsample_step]
-    y_centres = y_centres[::downsample_step]
     if rgb_grid is not None:
         rgb_grid = rgb_grid[::downsample_step, ::downsample_step]
 
     z_grid = _z_grid(
-        mean_grid,
+        gridmap,
+        downsample_step=downsample_step,
         x_centres=x_centres,
         y_centres=y_centres,
         z_by=z_by,
+        z_source=z_source,
         z_scale=z_scale,
         baseline_data=baseline_data,
     )
@@ -176,10 +222,12 @@ def build_gridmap_surface(
     vertices = np.column_stack((xx[valid], yy[valid], z_grid[valid])).astype(float)
     colors = _grid_colors(
         rgb_grid,
-        mean_grid=mean_grid,
+        gridmap=gridmap,
+        downsample_step=downsample_step,
         valid_mask=valid,
         expected_shape=mean_grid.shape,
         color_by=color_by,
+        color_source=color_source,
         color_binary=color_binary,
         color_threshold=color_threshold,
         color_invert=color_invert,
@@ -196,10 +244,12 @@ def build_gridmap_surface(
         source_path=gridmap.source_path,
         downsample_step=downsample_step,
         color_by=color_by,
+        color_source=color_source,
         color_binary=bool(color_binary),
         color_threshold=color_threshold,
         color_invert=bool(color_invert),
         z_by=z_by,
+        z_source=z_source,
         z_scale=z_scale,
         x_range=x_range,
         y_range=y_range,
@@ -237,10 +287,12 @@ def stack_gridmap_surfaces(
         source_path=first.source_path,
         downsample_step=first.downsample_step,
         color_by=first.color_by,
+        color_source=first.color_source,
         color_binary=first.color_binary,
         color_threshold=first.color_threshold,
         color_invert=first.color_invert,
         z_by=first.z_by,
+        z_source=first.z_source,
         z_scale=first.z_scale,
         x_range=first.x_range,
         y_range=first.y_range,
@@ -255,19 +307,35 @@ def _normalise_downsample_step(value: int) -> int:
 
 
 def _normalise_color_by(value: str) -> str:
-    normalised = str(value or "rgb").strip().lower()
+    raw = str(value or "rgb").strip()
+    if _normalise_grid_array_mode(raw) is not None:
+        return "height"
+
+    normalised = raw.lower()
     aliases = {
         "rgb": "rgb",
         "height": "height",
         "mean": "height",
         "mean height": "height",
+        "denoised height": "height",
+        "denoised mean": "height",
+        "denoised mean height": "height",
+        "denoised_height": "height",
         "deformation": "deformation",
         "deformation from baseline": "deformation",
         "deformation from first scan": "deformation",
+        "denoised deformation": "deformation",
+        "denoised deformation from baseline": "deformation",
+        "denoised deformation from first scan": "deformation",
+        "denoised_deformation": "deformation",
         "absolute deformation": "absolute_deformation",
         "absolute deformation from baseline": "absolute_deformation",
         "absolute deformation from first scan": "absolute_deformation",
         "absolute_deformation": "absolute_deformation",
+        "denoised absolute deformation": "absolute_deformation",
+        "denoised absolute deformation from baseline": "absolute_deformation",
+        "denoised absolute deformation from first scan": "absolute_deformation",
+        "denoised_absolute_deformation": "absolute_deformation",
     }
     if normalised in aliases:
         return aliases[normalised]
@@ -275,24 +343,117 @@ def _normalise_color_by(value: str) -> str:
 
 
 def _normalise_z_by(value: str) -> str:
-    normalised = str(value or "mean").strip().lower()
+    raw = str(value or "height").strip()
+    if _normalise_grid_array_mode(raw) is not None:
+        return "height"
+
+    normalised = raw.lower()
     aliases = {
-        "height": "mean",
-        "mean height": "mean",
-        "actual mean": "mean",
-        "mean": "mean",
+        "height": "height",
+        "mean height": "height",
+        "actual mean": "height",
+        "mean": "height",
+        "denoised height": "height",
+        "denoised mean height": "height",
+        "denoised mean": "height",
+        "denoised_mean": "height",
         "deformation": "deformation",
         "deformation from baseline": "deformation",
         "deformation from first scan": "deformation",
         "relative to first scan": "deformation",
+        "denoised deformation": "deformation",
+        "denoised deformation from baseline": "deformation",
+        "denoised deformation from first scan": "deformation",
+        "denoised_deformation": "deformation",
         "absolute deformation": "absolute_deformation",
         "absolute deformation from baseline": "absolute_deformation",
         "absolute deformation from first scan": "absolute_deformation",
         "absolute_deformation": "absolute_deformation",
+        "denoised absolute deformation": "absolute_deformation",
+        "denoised absolute deformation from baseline": "absolute_deformation",
+        "denoised absolute deformation from first scan": "absolute_deformation",
+        "denoised_absolute_deformation": "absolute_deformation",
         "flat": "flat",
         "none": "flat",
     }
-    return aliases.get(normalised, "mean")
+    return aliases.get(normalised, "height")
+
+
+def _normalise_grid_array_mode(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if raw.lower().startswith(GRID_ARRAY_MODE_PREFIX):
+        key = raw.split(":", 1)[1].strip()
+        return f"{GRID_ARRAY_MODE_PREFIX}{key}" if key else None
+    return None
+
+
+def _normalise_scalar_source(value: str | None, *, fallback: str) -> str:
+    raw = str(value or fallback).strip()
+    array_mode = _normalise_grid_array_mode(raw)
+    if array_mode is not None:
+        return array_mode
+
+    aliases = {
+        "mean": "mean",
+        "height": "mean",
+        "mean height": "mean",
+        "visual_mean": "visual_mean",
+        "visual mean": "visual_mean",
+        "mean (visual smoothed)": "visual_mean",
+        "visual smoothed mean": "visual_mean",
+        "denoised_mean": "visual_mean",
+        "denoised mean": "visual_mean",
+        "denoised mean height": "visual_mean",
+        "mean (variance corrected)": "visual_mean",
+        "variance corrected mean": "visual_mean",
+    }
+    return aliases.get(raw.lower(), "mean")
+
+
+def _legacy_color_source(value: str) -> str:
+    raw = str(value or "rgb").strip()
+    array_mode = _normalise_grid_array_mode(raw)
+    if array_mode is not None:
+        return array_mode
+    if raw.lower() in {
+        "denoised height",
+        "denoised mean",
+        "denoised mean height",
+        "denoised_height",
+        "denoised deformation",
+        "denoised deformation from baseline",
+        "denoised deformation from first scan",
+        "denoised_deformation",
+        "denoised absolute deformation",
+        "denoised absolute deformation from baseline",
+        "denoised absolute deformation from first scan",
+        "denoised_absolute_deformation",
+    }:
+        return "visual_mean"
+    return "mean"
+
+
+def _legacy_z_source(value: str) -> str:
+    raw = str(value or "height").strip()
+    array_mode = _normalise_grid_array_mode(raw)
+    if array_mode is not None:
+        return array_mode
+    if raw.lower() in {
+        "denoised height",
+        "denoised mean",
+        "denoised mean height",
+        "denoised_mean",
+        "denoised deformation",
+        "denoised deformation from baseline",
+        "denoised deformation from first scan",
+        "denoised_deformation",
+        "denoised absolute deformation",
+        "denoised absolute deformation from baseline",
+        "denoised absolute deformation from first scan",
+        "denoised_absolute_deformation",
+    }:
+        return "visual_mean"
+    return "mean"
 
 
 def _normalise_z_scale(value: float) -> float:
@@ -362,6 +523,116 @@ def _normalise_gridmap_metadata(
     return out
 
 
+def _scalar_grids_from_npz(data: Any, *, mean_grid: np.ndarray) -> dict[str, np.ndarray]:
+    scalar_grids: dict[str, np.ndarray] = {}
+    for key in data.files:
+        raw = np.asarray(data[key])
+        if raw.ndim != 2 or raw.shape != mean_grid.shape:
+            continue
+        if not np.issubdtype(raw.dtype, np.number):
+            continue
+        scalar_grids[str(key)] = np.asarray(raw, dtype=float)
+    scalar_grids.setdefault("mean", np.asarray(mean_grid, dtype=float))
+    return scalar_grids
+
+
+def _processed_measurement_scalar_grids(
+    raw_gridmap_path: Path, *, expected_shape: tuple[int, int]
+) -> dict[str, np.ndarray]:
+    confidence_path = _processed_grid_artifact_path(
+        raw_gridmap_path,
+        pattern="*_measurement_confidence.npz",
+    )
+    if confidence_path is None:
+        return {}
+
+    scalar_grids: dict[str, np.ndarray] = {}
+    try:
+        with np.load(confidence_path) as data:
+            for key in data.files:
+                raw = np.asarray(data[key])
+                if raw.ndim != 2 or raw.shape != expected_shape:
+                    continue
+                if not np.issubdtype(raw.dtype, np.number):
+                    continue
+                scalar_grids[str(key)] = np.asarray(raw, dtype=float)
+    except Exception as exc:
+        warnings.warn(
+            f"Could not read processed measurement confidence '{confidence_path}': {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {}
+    return scalar_grids
+
+
+def _processed_weighted_spline_scalar_grids(
+    raw_gridmap_path: Path, *, expected_shape: tuple[int, int]
+) -> dict[str, np.ndarray]:
+    spline_path = _processed_grid_artifact_path(
+        raw_gridmap_path,
+        pattern="*_weighted_spline_gridmap.npz",
+    )
+    if spline_path is None:
+        return {}
+
+    scalar_grids: dict[str, np.ndarray] = {}
+    try:
+        with np.load(spline_path) as data:
+            spline_mean = _same_shape_numeric_grid(
+                data,
+                key="mean",
+                expected_shape=expected_shape,
+            )
+            spline_residual = _same_shape_numeric_grid(
+                data,
+                key="weighted_spline_residual",
+                expected_shape=expected_shape,
+            )
+    except Exception as exc:
+        warnings.warn(
+            f"Could not read processed weighted spline gridmap '{spline_path}': {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {}
+
+    if spline_mean is not None:
+        scalar_grids["weighted_spline_mean"] = spline_mean
+    if spline_residual is not None:
+        scalar_grids["weighted_spline_residual"] = spline_residual
+    return scalar_grids
+
+
+def _same_shape_numeric_grid(
+    data: Any, *, key: str, expected_shape: tuple[int, int]
+) -> np.ndarray | None:
+    if key not in data:
+        return None
+    raw = np.asarray(data[key])
+    if (
+        raw.ndim != 2
+        or raw.shape != expected_shape
+        or not np.issubdtype(raw.dtype, np.number)
+    ):
+        return None
+    return np.asarray(raw, dtype=float)
+
+
+def _processed_grid_artifact_path(
+    raw_gridmap_path: Path, *, pattern: str
+) -> Path | None:
+    for parent in Path(raw_gridmap_path).parents:
+        if parent.name.lower() != "raw":
+            continue
+        processed_dir = parent.parent / "processed"
+        if not processed_dir.is_dir():
+            return None
+        matches = sorted(processed_dir.glob(pattern))
+        return matches[0] if matches else None
+    return None
+
+
 def _grid_centres(
     metadata: dict[str, Any], *, grid_shape: tuple[int, int]
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -376,50 +647,64 @@ def _grid_centres(
 
 
 def _z_grid(
-    mean_grid: np.ndarray,
+    gridmap: GridmapData,
     *,
+    downsample_step: int,
     x_centres: np.ndarray,
     y_centres: np.ndarray,
     z_by: str,
+    z_source: str,
     z_scale: float,
     baseline_data: GridmapData | None,
 ) -> np.ndarray:
     if z_by == "flat":
-        return np.zeros_like(mean_grid, dtype=float)
-
-    if z_by in {"deformation", "absolute_deformation"}:
-        if baseline_data is None:
-            raise ValueError("Deformation Z mode needs a baseline gridmap.")
-        baseline_grid = _sample_reference_mean(
-            baseline_data,
-            target_x_centres=x_centres,
-            target_y_centres=y_centres,
+        return np.zeros_like(
+            gridmap.mean_grid[::downsample_step, ::downsample_step], dtype=float
         )
-        deformation = np.asarray(mean_grid, dtype=float) - baseline_grid
-        if z_by == "absolute_deformation":
-            deformation = np.abs(deformation)
-        return deformation * z_scale
 
-    return np.asarray(mean_grid, dtype=float) * z_scale
+    if _is_deformation_mode(z_by):
+        return (
+            _deformation_grid(
+                gridmap,
+                mode=z_by,
+                source=z_source,
+                downsample_step=downsample_step,
+                x_centres=x_centres,
+                y_centres=y_centres,
+                baseline_data=baseline_data,
+                error_prefix="Deformation Z mode",
+            )
+            * z_scale
+        )
+
+    return (
+        _surface_scalar_grid(
+            gridmap,
+            source=z_source,
+            downsample_step=downsample_step,
+        )
+        * z_scale
+    )
 
 
-def _sample_reference_mean(
+def _sample_reference_grid(
     reference: GridmapData,
+    reference_grid: np.ndarray,
     *,
     target_x_centres: np.ndarray,
     target_y_centres: np.ndarray,
 ) -> np.ndarray:
     if (
-        reference.mean_grid.shape
+        reference_grid.shape
         == (len(target_y_centres), len(target_x_centres))
         and np.allclose(reference.x_centres, target_x_centres)
         and np.allclose(reference.y_centres, target_y_centres)
     ):
-        return reference.mean_grid.astype(float)
+        return reference_grid.astype(float)
 
     x_index = _nearest_indices(reference.x_centres, target_x_centres)
     y_index = _nearest_indices(reference.y_centres, target_y_centres)
-    sampled = reference.mean_grid[np.ix_(y_index, x_index)].astype(float)
+    sampled = reference_grid[np.ix_(y_index, x_index)].astype(float)
 
     outside_x = (
         (target_x_centres < float(reference.x_centres.min()))
@@ -434,6 +719,358 @@ def _sample_reference_mean(
     if np.any(outside_y):
         sampled[outside_y, :] = np.nan
     return sampled
+
+
+def _deformation_grid(
+    gridmap: GridmapData,
+    *,
+    mode: str,
+    source: str,
+    downsample_step: int,
+    x_centres: np.ndarray,
+    y_centres: np.ndarray,
+    baseline_data: GridmapData | None,
+    error_prefix: str,
+) -> np.ndarray:
+    if baseline_data is None:
+        raise ValueError(f"{error_prefix} needs a baseline gridmap.")
+
+    if source == "visual_mean":
+        deformation = _visual_smoothed_deformation_grid(
+            gridmap,
+            downsample_step=downsample_step,
+            x_centres=x_centres,
+            y_centres=y_centres,
+            baseline_data=baseline_data,
+        )
+        return np.abs(deformation) if mode == "absolute_deformation" else deformation
+
+    current_grid = _surface_scalar_grid(
+        gridmap,
+        source=source,
+        downsample_step=downsample_step,
+    )
+    baseline_grid = _sample_reference_grid(
+        baseline_data,
+        _source_scalar_grid(baseline_data, source=source),
+        target_x_centres=x_centres,
+        target_y_centres=y_centres,
+    )
+    deformation = np.asarray(current_grid, dtype=float) - baseline_grid
+    if mode == "absolute_deformation":
+        deformation = np.abs(deformation)
+    return deformation
+
+
+def _visual_smoothed_deformation_grid(
+    gridmap: GridmapData,
+    *,
+    downsample_step: int,
+    x_centres: np.ndarray,
+    y_centres: np.ndarray,
+    baseline_data: GridmapData,
+) -> np.ndarray:
+    current_grid = _surface_scalar_grid(
+        gridmap,
+        source="mean",
+        downsample_step=downsample_step,
+    )
+    baseline_grid = _sample_reference_grid(
+        baseline_data,
+        _source_scalar_grid(baseline_data, source="mean"),
+        target_x_centres=x_centres,
+        target_y_centres=y_centres,
+    )
+    deformation = np.asarray(current_grid, dtype=float) - baseline_grid
+
+    current_confidence = _mean_visual_confidence(gridmap)
+    baseline_confidence = _mean_visual_confidence(baseline_data)
+    if current_confidence is None or baseline_confidence is None:
+        return deformation
+
+    current_confidence = np.asarray(current_confidence, dtype=float)[
+        ::downsample_step, ::downsample_step
+    ]
+    sampled_baseline_confidence = _sample_reference_grid(
+        baseline_data,
+        np.asarray(baseline_confidence, dtype=float),
+        target_x_centres=x_centres,
+        target_y_centres=y_centres,
+    )
+    confidence = np.minimum(current_confidence, sampled_baseline_confidence)
+    confidence[~np.isfinite(deformation)] = 0.0
+    return _visual_smooth_grid(deformation, confidence=confidence)
+
+
+def _surface_scalar_grid(
+    gridmap: GridmapData,
+    *,
+    source: str,
+    downsample_step: int,
+) -> np.ndarray:
+    return _source_scalar_grid(gridmap, source=source)[
+        ::downsample_step, ::downsample_step
+    ]
+
+
+def _source_scalar_grid(gridmap: GridmapData, *, source: str) -> np.ndarray:
+    if source == "mean":
+        grid = gridmap.mean_grid
+    elif source == "visual_mean":
+        grid = _visual_mean_grid(gridmap)
+    elif source.startswith(GRID_ARRAY_MODE_PREFIX):
+        grid = _gridmap_array(gridmap, source.split(":", 1)[1])
+    else:
+        grid = gridmap.mean_grid
+    return np.asarray(grid, dtype=float)
+
+
+def _is_deformation_mode(mode: str) -> bool:
+    return mode in {"deformation", "absolute_deformation"}
+
+
+def _gridmap_array(gridmap: GridmapData, key: str) -> np.ndarray:
+    grid = gridmap.scalar_grids.get(str(key))
+    if grid is None:
+        available = ", ".join(gridmap.scalar_grids) or "(none)"
+        raise KeyError(
+            f"Gridmap '{gridmap.source_path.name}' has no scalar array '{key}'. "
+            f"Available: {available}"
+        )
+    return np.asarray(grid, dtype=float)
+
+
+def _visual_mean_grid(gridmap: GridmapData) -> np.ndarray:
+    mean = np.asarray(gridmap.mean_grid, dtype=float)
+    confidence = _mean_visual_confidence(gridmap)
+    if confidence is None:
+        return mean
+    return _visual_smooth_grid(mean, confidence=confidence)
+
+
+def _mean_visual_confidence(gridmap: GridmapData) -> np.ndarray | None:
+    confidence = _first_scalar_array(gridmap, _CONFIDENCE_ARRAY_KEYS)
+    if confidence is not None:
+        stored_confidence = np.asarray(confidence, dtype=float)
+        valid = np.isfinite(gridmap.mean_grid) & np.isfinite(stored_confidence)
+        if np.any(valid & (stored_confidence > 0.0)):
+            bounded_confidence = np.zeros(stored_confidence.shape, dtype=float)
+            bounded_confidence[valid] = np.clip(stored_confidence[valid], 0.0, 1.0)
+            return bounded_confidence
+
+    variance = _first_scalar_array(gridmap, _VARIANCE_ARRAY_KEYS)
+    if variance is None:
+        return None
+    count = _first_scalar_array(gridmap, _COUNT_ARRAY_KEYS)
+    return _visual_confidence(
+        variance=np.asarray(variance, dtype=float),
+        count=None if count is None else np.asarray(count, dtype=float),
+        valid=np.isfinite(gridmap.mean_grid),
+    )
+
+
+def _first_scalar_array(
+    gridmap: GridmapData, keys: tuple[str, ...]
+) -> np.ndarray | None:
+    keys_lc = {key.lower(): key for key in gridmap.scalar_grids}
+    for candidate in keys:
+        actual = keys_lc.get(candidate.lower())
+        if actual is not None:
+            return gridmap.scalar_grids[actual]
+    return None
+
+
+def _visual_confidence(
+    *,
+    variance: np.ndarray,
+    count: np.ndarray | None,
+    valid: np.ndarray,
+) -> np.ndarray | None:
+    variance_grid = np.asarray(variance, dtype=float)
+    use = valid & np.isfinite(variance_grid) & (variance_grid >= 0.0)
+    positive = variance_grid[use & (variance_grid > 0.0)]
+    if not positive.size:
+        return None
+
+    reference = max(
+        float(np.nanpercentile(positive, _VISUAL_VARIANCE_REFERENCE_PERCENTILE)),
+        np.finfo(float).eps,
+    )
+    ratio = np.zeros(variance_grid.shape, dtype=float)
+    ratio[use] = variance_grid[use] / reference
+    confidence = np.ones(variance_grid.shape, dtype=float)
+    confidence[use] = 1.0 / (
+        1.0 + ratio[use] ** _VISUAL_VARIANCE_CONFIDENCE_POWER
+    )
+    if count is not None and count.shape == variance_grid.shape:
+        count_grid = np.asarray(count, dtype=float)
+        count_use = valid & np.isfinite(count_grid) & (count_grid > 0.0)
+        positive_counts = count_grid[count_use]
+        if positive_counts.size:
+            count_reference = max(
+                float(
+                    np.nanpercentile(
+                        positive_counts,
+                        _VISUAL_COUNT_REFERENCE_PERCENTILE,
+                    )
+                ),
+                1.0,
+            )
+            count_ratio = np.zeros(count_grid.shape, dtype=float)
+            count_ratio[count_use] = np.clip(
+                count_grid[count_use] / count_reference,
+                0.0,
+                1.0,
+            )
+            confidence[count_use] *= (
+                count_ratio[count_use] ** _VISUAL_COUNT_CONFIDENCE_POWER
+            )
+            confidence[valid & ~count_use] = 0.0
+    confidence[~valid] = 0.0
+    return confidence
+
+
+def _visual_smooth_grid(
+    values: np.ndarray, *, confidence: np.ndarray
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    confidence = np.asarray(confidence, dtype=float)
+    finite = np.isfinite(values)
+    local_median = _local_median_grid(values, radius=_VISUAL_OUTLIER_RADIUS)
+    local_mad = _local_median_grid(
+        np.abs(values - local_median),
+        radius=_VISUAL_OUTLIER_RADIUS,
+    )
+    local_scale = np.maximum(1.4826 * local_mad, np.finfo(float).eps)
+    local_outlier = (
+        finite
+        & np.isfinite(local_median)
+        & (np.abs(values - local_median) > _VISUAL_OUTLIER_MAD_FACTOR * local_scale)
+    )
+    repair = finite & (
+        (confidence < _VISUAL_VERY_LOW_CONFIDENCE)
+        | ((confidence < _VISUAL_LOW_CONFIDENCE) & local_outlier)
+    )
+    return _inpaint_visual_outliers(values, confidence=confidence, repair=repair)
+
+
+def _inpaint_visual_outliers(
+    values: np.ndarray,
+    *,
+    confidence: np.ndarray,
+    repair: np.ndarray,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    confidence = np.asarray(confidence, dtype=float)
+    finite = np.isfinite(values)
+    repair = np.asarray(repair, dtype=bool) & finite
+    if not np.any(repair):
+        return values
+
+    # Outliers do not get to donate to their own visual repair.
+    repaired_values = values.copy()
+    repaired_values[repair] = np.nan
+    missing = repair.copy()
+    for _ in range(_VISUAL_INPAINT_ITERATIONS):
+        local_estimate = _local_median_grid(repaired_values)
+        fill = missing & np.isfinite(local_estimate)
+        if not np.any(fill):
+            break
+        repaired_values[fill] = local_estimate[fill]
+        missing[fill] = False
+        if not np.any(missing):
+            break
+
+    if np.any(missing):
+        donors = finite & ~repair
+        for radius in _VISUAL_FALLBACK_RADII:
+            fallback = _confidence_weighted_mean_grid(
+                values,
+                confidence=confidence,
+                donor_mask=donors,
+                radius=radius,
+            )
+            fill = missing & np.isfinite(fallback)
+            repaired_values[fill] = fallback[fill]
+            missing[fill] = False
+            if not np.any(missing):
+                break
+
+    out = values.copy()
+    use = repair & np.isfinite(repaired_values)
+    out[use] = repaired_values[use]
+    return out
+
+
+def _local_median_grid(values: np.ndarray, *, radius: int = 1) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    rows, cols = values.shape
+
+    radius = max(1, int(radius))
+    padded_values = np.pad(values, radius, mode="constant", constant_values=np.nan)
+    neighbours = np.stack(
+        [
+            padded_values[
+                radius + row_offset : radius + row_offset + rows,
+                radius + col_offset : radius + col_offset + cols,
+            ]
+            for row_offset in range(-radius, radius + 1)
+            for col_offset in range(-radius, radius + 1)
+        ],
+        axis=0,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(neighbours, axis=0)
+
+
+def _confidence_weighted_mean_grid(
+    values: np.ndarray,
+    *,
+    confidence: np.ndarray,
+    donor_mask: np.ndarray,
+    radius: int,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    confidence = np.asarray(confidence, dtype=float)
+    donors = np.asarray(donor_mask, dtype=bool)
+    use = (
+        donors
+        & np.isfinite(values)
+        & np.isfinite(confidence)
+        & (confidence > 0.0)
+    )
+
+    weights = np.zeros(values.shape, dtype=float)
+    weights[use] = confidence[use] ** _VISUAL_DONOR_WEIGHT_POWER
+    weighted_values = np.zeros(values.shape, dtype=float)
+    weighted_values[use] = values[use] * weights[use]
+
+    total = _box_sum_grid(weighted_values, radius=radius)
+    weight_total = _box_sum_grid(weights, radius=radius)
+    out = np.full(values.shape, np.nan, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        averaged = total / weight_total
+    out[weight_total > 0.0] = averaged[weight_total > 0.0]
+    return out
+
+
+def _box_sum_grid(values: np.ndarray, *, radius: int) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    rows, cols = values.shape
+    integral = np.pad(values, ((1, 0), (1, 0)), constant_values=0.0)
+    integral = integral.cumsum(axis=0).cumsum(axis=1)
+
+    row_low = np.maximum(np.arange(rows) - int(radius), 0)
+    row_high = np.minimum(np.arange(rows) + int(radius) + 1, rows)
+    col_low = np.maximum(np.arange(cols) - int(radius), 0)
+    col_high = np.minimum(np.arange(cols) + int(radius) + 1, cols)
+    return (
+        integral[row_high[:, None], col_high[None, :]]
+        - integral[row_low[:, None], col_high[None, :]]
+        - integral[row_high[:, None], col_low[None, :]]
+        + integral[row_low[:, None], col_low[None, :]]
+    )
 
 
 def _nearest_indices(source_values: np.ndarray, target_values: np.ndarray) -> np.ndarray:
@@ -452,10 +1089,12 @@ def _nearest_indices(source_values: np.ndarray, target_values: np.ndarray) -> np
 def _grid_colors(
     rgb_grid: np.ndarray | None,
     *,
-    mean_grid: np.ndarray,
+    gridmap: GridmapData,
+    downsample_step: int,
     valid_mask: np.ndarray,
     expected_shape: tuple[int, int],
     color_by: str,
+    color_source: str,
     color_binary: bool,
     color_threshold: float,
     color_invert: bool,
@@ -465,26 +1104,29 @@ def _grid_colors(
 ) -> np.ndarray:
     if color_by == "height":
         return _scalar_colors(
-            mean_grid,
+            _surface_scalar_grid(
+                gridmap,
+                source=color_source,
+                downsample_step=downsample_step,
+            ),
             valid_mask=valid_mask,
             binary=color_binary,
             threshold=color_threshold,
             invert=color_invert,
         )
 
-    if color_by in {"deformation", "absolute_deformation"}:
-        if baseline_data is None:
-            raise ValueError("Deformation colour mode needs a baseline gridmap.")
-        baseline_grid = _sample_reference_mean(
-            baseline_data,
-            target_x_centres=x_centres,
-            target_y_centres=y_centres,
-        )
-        deformation = np.asarray(mean_grid, dtype=float) - baseline_grid
-        if color_by == "absolute_deformation":
-            deformation = np.abs(deformation)
+    if _is_deformation_mode(color_by):
         return _scalar_colors(
-            deformation,
+            _deformation_grid(
+                gridmap,
+                mode=color_by,
+                source=color_source,
+                downsample_step=downsample_step,
+                x_centres=x_centres,
+                y_centres=y_centres,
+                baseline_data=baseline_data,
+                error_prefix="Deformation colour mode",
+            ),
             valid_mask=valid_mask,
             binary=color_binary,
             threshold=color_threshold,

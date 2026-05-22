@@ -10,7 +10,9 @@ import sys
 
 from .loaders import (
     GEOMETRY_EXTENSIONS,
+    GRID_ARRAY_MODE_PREFIX,
     GRIDMAP_EXTENSIONS,
+    gridmap_scalar_array_keys,
     load_gridmap_surface,
     require_supported_path,
 )
@@ -27,6 +29,22 @@ from .project import (
 
 MAX_STACK_VERTICES = 1_500_000
 MAX_STACK_TRIANGLES = 5_000_000
+COLOR_MODE_CHOICES = (
+    ("RGB", "rgb"),
+    ("Height", "height"),
+    ("Deformation From Baseline", "deformation"),
+    ("Absolute Deformation From Baseline", "absolute_deformation"),
+)
+Z_MODE_CHOICES = (
+    ("Height", "height"),
+    ("Deformation From Baseline", "deformation"),
+    ("Absolute Deformation From Baseline", "absolute_deformation"),
+    ("Flat", "flat"),
+)
+SCALAR_SOURCE_CHOICES = (
+    ("Mean", "mean"),
+    ("Mean (visual smoothed)", "visual_mean"),
+)
 
 
 def _import_open3d() -> tuple[Any, Any, Any]:
@@ -80,12 +98,16 @@ class ViewerApp:
         self.downsample_input.set_on_value_changed(self._downsample_input_changed)
 
         self.color_combo = self.gui.Combobox()
-        self.color_combo.add_item("RGB")
-        self.color_combo.add_item("Height")
-        self.color_combo.add_item("Deformation From Baseline")
-        self.color_combo.add_item("Absolute Deformation From Baseline")
+        for label, _mode in COLOR_MODE_CHOICES:
+            self.color_combo.add_item(label)
         self.color_combo.selected_index = 0
         self.color_combo.set_on_selection_changed(self._surface_option_changed)
+
+        self.color_source_combo = self.gui.Combobox()
+        for label, _source in SCALAR_SOURCE_CHOICES:
+            self.color_source_combo.add_item(label)
+        self.color_source_combo.selected_index = 0
+        self.color_source_combo.set_on_selection_changed(self._surface_option_changed)
 
         self.color_binary_checkbox = self.gui.Checkbox("Binary red/green")
         self.color_binary_checkbox.set_on_checked(self._color_binary_changed)
@@ -109,12 +131,16 @@ class ViewerApp:
         self.color_invert_checkbox.set_on_checked(self._color_binary_changed)
 
         self.z_combo = self.gui.Combobox()
-        self.z_combo.add_item("Mean Height")
-        self.z_combo.add_item("Deformation From Baseline")
-        self.z_combo.add_item("Absolute Deformation From Baseline")
-        self.z_combo.add_item("Flat")
+        for label, _mode in Z_MODE_CHOICES:
+            self.z_combo.add_item(label)
         self.z_combo.selected_index = 0
         self.z_combo.set_on_selection_changed(self._surface_option_changed)
+
+        self.z_source_combo = self.gui.Combobox()
+        for label, _source in SCALAR_SOURCE_CHOICES:
+            self.z_source_combo.add_item(label)
+        self.z_source_combo.selected_index = 0
+        self.z_source_combo.set_on_selection_changed(self._surface_option_changed)
 
         self.baseline_combo = self.gui.Combobox()
         self.baseline_combo.enabled = False
@@ -204,6 +230,7 @@ class ViewerApp:
         self._stack_scan_checkboxes: list[tuple[MilestoneScan, Any]] = []
         self._stack_surface_cache: list[tuple[MilestoneScan, Any]] = []
         self._stack_cache_signature: tuple[Any, ...] | None = None
+        self._grid_array_keys: list[str] = []
         self._current_scene_bounds: Any | None = None
         self._scene_has_geometry = False
 
@@ -228,7 +255,13 @@ class ViewerApp:
         self.side_panel.add_child(project_section)
 
         surface_section = self._make_section("Surface", em, is_open=True)
-        self._add_labeled_widget(surface_section, "Colour Source", self.color_combo, em)
+        self._add_labeled_widget(surface_section, "Colour Mode", self.color_combo, em)
+        self._add_labeled_widget(
+            surface_section,
+            "Colour Scalar Source",
+            self.color_source_combo,
+            em,
+        )
         surface_section.add_child(self.color_binary_checkbox)
         surface_section.add_child(self.gui.Label("Threshold (mm)"))
         threshold_row = self.gui.Horiz(0.4 * em)
@@ -246,6 +279,7 @@ class ViewerApp:
 
         z_section = self._make_section("Z Axis", em, is_open=True)
         self._add_labeled_widget(z_section, "Mode", self.z_combo, em)
+        self._add_labeled_widget(z_section, "Scalar Source", self.z_source_combo, em)
         self._add_labeled_widget(z_section, "Baseline", self.baseline_combo, em)
         z_section.add_child(self.gui.Label("Amplification"))
         z_scale_row = self.gui.Horiz(0.4 * em)
@@ -532,6 +566,73 @@ class ViewerApp:
             return
         self._apply_camera_preset(preset)
 
+    def _set_grid_array_source_choices(self, gridmap_paths: list[Path]) -> None:
+        keys: list[str] = []
+        for path in gridmap_paths:
+            try:
+                available = gridmap_scalar_array_keys(path)
+            except Exception:
+                continue
+            for key in available:
+                if key.lower() == "mean" or key in keys:
+                    continue
+                keys.append(key)
+
+        preferred_order = {
+            "weighted_spline_mean": 0,
+            "weighted_spline_residual": 1,
+            "median": 2,
+            "mode": 3,
+            "variance": 4,
+            "count": 5,
+            "confidence": 6,
+            "standard_error": 7,
+            "mean_variance": 8,
+            "precision_weight": 9,
+        }
+        keys.sort(key=lambda key: (preferred_order.get(key.lower(), 99), key.lower()))
+        if keys == self._grid_array_keys:
+            return
+
+        selected_color_source = self._color_source()
+        selected_z_source = self._z_source()
+        self._grid_array_keys = keys
+        self._replace_source_choices(
+            self.color_source_combo,
+            selected_source=selected_color_source,
+        )
+        self._replace_source_choices(
+            self.z_source_combo,
+            selected_source=selected_z_source,
+        )
+
+    def _replace_source_choices(
+        self,
+        combo: Any,
+        *,
+        selected_source: str,
+    ) -> None:
+        combo.clear_items()
+        selected_index = 0
+        for index, (label, source) in enumerate(self._scalar_source_choices()):
+            combo.add_item(label)
+            if source == selected_source:
+                selected_index = index
+        combo.selected_index = selected_index
+
+    def _scalar_source_choices(self) -> list[tuple[str, str]]:
+        return [
+            *SCALAR_SOURCE_CHOICES,
+            *(
+                (self._grid_array_source_label(key), f"{GRID_ARRAY_MODE_PREFIX}{key}")
+                for key in self._grid_array_keys
+            ),
+        ]
+
+    @staticmethod
+    def _grid_array_source_label(key: str) -> str:
+        return str(key or "array").replace("_", " ").strip().title() or "Array"
+
     def load_path(self, path: Path) -> None:
         path = Path(path)
         if path.is_dir():
@@ -548,6 +649,13 @@ class ViewerApp:
                     "No Surface Scanner milestones with a processed surface or raw gridmap were found."
                 )
             self._milestone_scans = scans
+            self._set_grid_array_source_choices(
+                [
+                    scan.raw_gridmap_path
+                    for scan in scans
+                    if scan.raw_gridmap_path is not None
+                ]
+            )
             self._clear_stack_cache()
             self.milestone_combo.clear_items()
             for scan in scans:
@@ -563,6 +671,7 @@ class ViewerApp:
             self._clear_stack_cache()
             self._loaded_project_dir = None
             self._loaded_surface_scanner_dir = None
+            self._set_grid_array_source_choices([])
             self._scene_has_geometry = False
             self._current_scene_bounds = None
             self.milestone_combo.clear_items()
@@ -684,10 +793,12 @@ class ViewerApp:
                 scan.raw_gridmap_path,
                 downsample_step=self._downsample_step(),
                 color_by=self._color_by(),
+                color_source=self._color_source(),
                 color_binary=self._color_binary(),
                 color_threshold=self._color_threshold(),
                 color_invert=self._color_invert(),
                 z_by=self._z_by(),
+                z_source=self._z_source(),
                 z_scale=self._z_scale(),
                 baseline_path=self._baseline_gridmap_path(scan),
                 x_range=self._x_range(),
@@ -699,8 +810,9 @@ class ViewerApp:
             self.status.text = (
                 f"{scan.label} | generated from raw gridmap | "
                 f"downsample {surface.downsample_step}, "
-                f"colour {self._display_mode_label(surface.color_by)}, "
-                f"z {self._display_mode_label(surface.z_by)} x{surface.z_scale:g}"
+                f"colour {self._axis_selection_label(surface.color_by, surface.color_source)}, "
+                f"z {self._axis_selection_label(surface.z_by, surface.z_source)} "
+                f"x{surface.z_scale:g}"
             )
             self.details.text = self._scan_details(scan)
         except Exception as exc:
@@ -736,10 +848,12 @@ class ViewerApp:
                     scan.raw_gridmap_path,
                     downsample_step=self._downsample_step(),
                     color_by=self._color_by(),
+                    color_source=self._color_source(),
                     color_binary=self._color_binary(),
                     color_threshold=self._color_threshold(),
                     color_invert=self._color_invert(),
                     z_by=self._z_by(),
+                    z_source=self._z_source(),
                     z_scale=self._z_scale(),
                     baseline_path=baseline_path,
                     x_range=self._x_range(),
@@ -802,7 +916,7 @@ class ViewerApp:
         first_surface = self._stack_surface_cache[0][1]
         self.status.text = (
             f"Stacked {count} milestones | separation {separation:g} | "
-            f"z {self._display_mode_label(first_surface.z_by)} "
+            f"z {self._axis_selection_label(first_surface.z_by, first_surface.z_source)} "
             f"x{first_surface.z_scale:g}"
         )
         self.details.text = self._stack_details(failures=failures)
@@ -820,6 +934,7 @@ class ViewerApp:
             self._set_loaded_project_context(path)
             path = require_supported_path(path)
             if path.suffix.lower() in GRIDMAP_EXTENSIONS:
+                self._set_grid_array_source_choices([path])
                 geometry = self._load_gridmap(path)
                 material = self.mesh_material if self._is_mesh(geometry) else self.material
                 label = self._geometry_label(path, geometry)
@@ -841,10 +956,12 @@ class ViewerApp:
             path,
             downsample_step=self._downsample_step(),
             color_by=self._color_by(),
+            color_source=self._color_source(),
             color_binary=self._color_binary(),
             color_threshold=self._color_threshold(),
             color_invert=self._color_invert(),
             z_by=self._z_by(),
+            z_source=self._z_source(),
             z_scale=self._z_scale(),
             baseline_path=path if self._uses_baseline() else None,
             x_range=self._x_range(),
@@ -1062,8 +1179,10 @@ class ViewerApp:
             "height": height,
             "camera_preset": str(self.camera_combo.selected_text or "Current / Mouse"),
             "view_mode": str(self.view_mode_combo.selected_text or ""),
-            "colour": self._display_mode_label(self._color_by()),
-            "z_axis": self._display_mode_label(self._z_by()),
+            "colour": self._display_axis_label(self._color_by()),
+            "colour_source": self._display_source_label(self._color_source()),
+            "z_axis": self._display_axis_label(self._z_by()),
+            "z_source": self._display_source_label(self._z_source()),
             "z_scale": self._z_scale(),
             "downsample_step": self._downsample_step(),
             "section": self._section_label(),
@@ -1085,17 +1204,17 @@ class ViewerApp:
         stack_mode = self._is_stack_mode()
         current = self._current_scan
         color_by = self._color_by()
-        scalar_colour = color_by in {
-            "height",
-            "deformation",
-            "absolute_deformation",
-        }
-        binary_colour = bool(self.color_binary_checkbox.checked)
+        binary_colour_supported = color_by != "rgb"
+        binary_colour = binary_colour_supported and bool(
+            self.color_binary_checkbox.checked
+        )
         signed_deformation_gradient = color_by == "deformation" and not binary_colour
         self.milestone_combo.enabled = bool(self._milestone_scans)
         self.baseline_combo.enabled = bool(self._baseline_scans())
-        self.color_binary_checkbox.enabled = scalar_colour
-        threshold_enabled = scalar_colour and binary_colour
+        self.color_source_combo.enabled = color_by != "rgb"
+        self.z_source_combo.enabled = self._z_by() != "flat"
+        self.color_binary_checkbox.enabled = binary_colour_supported
+        threshold_enabled = binary_colour_supported and binary_colour
         self.color_threshold_slider.enabled = threshold_enabled
         self.color_threshold_input.enabled = threshold_enabled
         self.color_invert_checkbox.enabled = threshold_enabled or signed_deformation_gradient
@@ -1160,10 +1279,12 @@ class ViewerApp:
             tuple(str(scan.raw_gridmap_path) for scan in scans),
             self._downsample_step(),
             self._color_by(),
+            self._color_source(),
             self._color_binary(),
             self._color_threshold(),
             self._color_invert(),
             self._z_by(),
+            self._z_source(),
             self._z_scale(),
             str(baseline_path) if baseline_path is not None else "",
             self._x_range(),
@@ -1177,21 +1298,17 @@ class ViewerApp:
             return 1
 
     def _color_by(self) -> str:
-        value = str(self.color_combo.selected_text or "RGB").strip().lower()
-        if value == "height":
-            return "height"
-        if value == "deformation from baseline":
-            return "deformation"
-        if value == "absolute deformation from baseline":
-            return "absolute_deformation"
+        value = str(self.color_combo.selected_text or "RGB").strip()
+        for label, mode in COLOR_MODE_CHOICES:
+            if value.lower() == label.lower():
+                return mode
         return "rgb"
 
+    def _color_source(self) -> str:
+        return self._scalar_source_from_combo(self.color_source_combo)
+
     def _color_binary(self) -> bool:
-        return self._color_by() in {
-            "height",
-            "deformation",
-            "absolute_deformation",
-        } and bool(self.color_binary_checkbox.checked)
+        return self._color_by() != "rgb" and bool(self.color_binary_checkbox.checked)
 
     def _color_threshold(self) -> float:
         try:
@@ -1207,16 +1324,20 @@ class ViewerApp:
         return self._color_by() == "deformation"
 
     def _z_by(self) -> str:
-        value = str(self.z_combo.selected_text or "Mean Height").strip().lower()
-        if value in {"deformation from baseline", "deformation from first scan"}:
-            return "deformation"
-        if value in {
-            "absolute deformation from baseline",
-            "absolute deformation from first scan",
-        }:
-            return "absolute_deformation"
-        if value == "flat":
-            return "flat"
+        value = str(self.z_combo.selected_text or "Height").strip()
+        for label, mode in Z_MODE_CHOICES:
+            if value.lower() == label.lower():
+                return mode
+        return "height"
+
+    def _z_source(self) -> str:
+        return self._scalar_source_from_combo(self.z_source_combo)
+
+    def _scalar_source_from_combo(self, combo: Any) -> str:
+        value = str(combo.selected_text or "Mean").strip()
+        for label, source in self._scalar_source_choices():
+            if value.lower() == label.lower():
+                return source
         return "mean"
 
     def _z_scale(self) -> float:
@@ -1259,16 +1380,32 @@ class ViewerApp:
         return self._z_by() in deformation_modes or self._color_by() in deformation_modes
 
     @staticmethod
-    def _display_mode_label(mode: str) -> str:
+    def _display_axis_label(mode: str) -> str:
         labels = {
             "rgb": "RGB",
             "height": "height",
-            "mean": "mean height",
             "deformation": "signed deformation",
             "absolute_deformation": "absolute deformation",
             "flat": "flat",
         }
         return labels.get(mode, mode)
+
+    @staticmethod
+    def _display_source_label(source: str) -> str:
+        if source.startswith(GRID_ARRAY_MODE_PREFIX):
+            return source.split(":", 1)[1]
+        labels = {
+            "mean": "mean",
+            "visual_mean": "mean (visual smoothed)",
+        }
+        return labels.get(source, source)
+
+    @classmethod
+    def _axis_selection_label(cls, mode: str, source: str) -> str:
+        axis = cls._display_axis_label(mode)
+        if mode in {"rgb", "flat"}:
+            return axis
+        return f"{axis} of {cls._display_source_label(source)}"
 
     def _baseline_gridmap_path(self, scan: MilestoneScan | None = None) -> Path | None:
         if not self._uses_baseline():

@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 
 from alf_scan_viewer.loaders import (
+    gridmap_scalar_array_keys,
     load_gridmap_surface,
     require_supported_path,
     stack_gridmap_surfaces,
@@ -90,6 +91,282 @@ class LoaderTests(unittest.TestCase):
             self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
             self.assertGreater(surface.colors[-1, 0], surface.colors[-1, 2])
 
+    def test_scalar_grid_arrays_can_drive_colour_and_z_axis(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            np.savez(
+                npz_path,
+                mean=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+                median=np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float),
+                variance=np.array([[0.0, 0.1], [0.2, 0.3]], dtype=float),
+                count=np.array([[1, 2], [3, 4]], dtype=int),
+                rgb=np.zeros((2, 2, 3), dtype=float),
+            )
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 2, "y_min": 0, "y_max": 2}),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="array:median",
+                color_by="height",
+                color_source="array:variance",
+            )
+
+            self.assertEqual(
+                gridmap_scalar_array_keys(npz_path),
+                ["mean", "median", "variance", "count"],
+            )
+            self.assertEqual(surface.z_by, "height")
+            self.assertEqual(surface.z_source, "array:median")
+            self.assertEqual(surface.color_by, "height")
+            self.assertEqual(surface.color_source, "array:variance")
+            self.assertEqual(surface.vertices[:, 2].tolist(), [10.0, 20.0, 30.0, 40.0])
+            self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
+            self.assertGreater(surface.colors[-1, 0], surface.colors[-1, 2])
+
+    def test_visual_smoothed_mean_suppresses_high_variance_spike(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            mean = np.zeros((3, 3), dtype=float)
+            mean[1, 1] = 10.0
+            variance = np.full((3, 3), 0.01, dtype=float)
+            variance[1, 1] = 100.0
+            np.savez(npz_path, mean=mean, variance=variance, count=np.ones((3, 3)))
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 3}),
+                encoding="utf-8",
+            )
+
+            raw = load_gridmap_surface(npz_path)
+            smoothed = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="mean (visual smoothed)",
+            )
+
+            self.assertEqual(raw.vertices[4, 2], 10.0)
+            self.assertLess(smoothed.vertices[4, 2], 0.01)
+            self.assertEqual(smoothed.z_by, "height")
+            self.assertEqual(smoothed.z_source, "visual_mean")
+
+    def test_visual_smoothed_mean_repairs_high_variance_patch(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            mean = np.zeros((25, 25), dtype=float)
+            mean[8:17, 8:17] = 10.0
+            variance = np.full((25, 25), 0.01, dtype=float)
+            variance[8:17, 8:17] = 100.0
+            np.savez(npz_path, mean=mean, variance=variance)
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 25, "y_min": 0, "y_max": 25}),
+                encoding="utf-8",
+            )
+
+            corrected = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="mean (visual smoothed)",
+            )
+
+            self.assertLess(corrected.vertices[312, 2], 0.1)
+
+    def test_visual_smoothed_mean_does_not_move_trusted_neighbour(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            mean = np.zeros((5, 5), dtype=float)
+            mean[2, 1] = 3.0
+            mean[2, 2] = 10.0
+            variance = np.full((5, 5), 0.01, dtype=float)
+            variance[2, 2] = 100.0
+            np.savez(npz_path, mean=mean, variance=variance)
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 5, "y_min": 0, "y_max": 5}),
+                encoding="utf-8",
+            )
+
+            corrected = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="mean (visual smoothed)",
+            )
+
+            self.assertEqual(corrected.vertices[11, 2], 3.0)
+            self.assertLess(corrected.vertices[12, 2], 3.0)
+
+    def test_visual_smoothed_mean_uses_point_count_for_confidence(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            mean = np.zeros((7, 7), dtype=float)
+            mean[2, 2] = 10.0
+            mean[4, 4] = 10.0
+            variance = np.ones((7, 7), dtype=float)
+            count = np.full((7, 7), 100, dtype=int)
+            count[2, 2] = 1
+            np.savez(npz_path, mean=mean, variance=variance, count=count)
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 7, "y_min": 0, "y_max": 7}),
+                encoding="utf-8",
+            )
+
+            smoothed = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="mean (visual smoothed)",
+            )
+
+            self.assertLess(smoothed.vertices[16, 2], 0.01)
+            self.assertEqual(smoothed.vertices[32, 2], 10.0)
+
+    def test_processed_measurement_confidence_drives_visual_smoothing(self) -> None:
+        with TemporaryDirectory() as td:
+            milestone = (
+                Path(td)
+                / "data"
+                / "tools"
+                / "surface_scanner"
+                / "milestones"
+                / "post_bedding_in"
+                / "milestone_1000"
+            )
+            raw_dir = milestone / "raw"
+            processed_dir = milestone / "processed"
+            raw_dir.mkdir(parents=True)
+            processed_dir.mkdir()
+            npz_path = raw_dir / "scan.npz"
+            mean = np.zeros((3, 3), dtype=float)
+            mean[1, 1] = 10.0
+            np.savez(
+                npz_path,
+                mean=mean,
+                variance=np.full((3, 3), 0.01, dtype=float),
+                count=np.full((3, 3), 100, dtype=float),
+            )
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 3}),
+                encoding="utf-8",
+            )
+
+            processed_confidence = np.ones((3, 3), dtype=float)
+            processed_confidence[1, 1] = 0.0
+            np.savez(
+                processed_dir
+                / "project_post_bedding_in_1000_measurement_confidence.npz",
+                confidence=processed_confidence,
+                standard_error=np.full((3, 3), 0.25, dtype=float),
+            )
+
+            smoothed = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="mean (visual smoothed)",
+            )
+
+            self.assertIn("confidence", gridmap_scalar_array_keys(npz_path))
+            self.assertIn("standard_error", gridmap_scalar_array_keys(npz_path))
+            self.assertLess(smoothed.vertices[4, 2], 0.01)
+
+    def test_processed_weighted_spline_gridmap_can_drive_colour_and_z_axis(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as td:
+            milestone = (
+                Path(td)
+                / "data"
+                / "tools"
+                / "surface_scanner"
+                / "milestones"
+                / "post_bedding_in"
+                / "milestone_1000"
+            )
+            raw_dir = milestone / "raw"
+            processed_dir = milestone / "processed"
+            raw_dir.mkdir(parents=True)
+            processed_dir.mkdir()
+            npz_path = raw_dir / "scan.npz"
+            np.savez(npz_path, mean=np.zeros((2, 2), dtype=float))
+            npz_path.with_suffix(".json").write_text(
+                json.dumps({"x_min": 0, "x_max": 2, "y_min": 0, "y_max": 2}),
+                encoding="utf-8",
+            )
+            np.savez(
+                processed_dir
+                / "project_post_bedding_in_1000_weighted_spline_gridmap.npz",
+                mean=np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float),
+                weighted_spline_residual=np.array(
+                    [[0.0, 0.1], [0.2, 0.3]],
+                    dtype=float,
+                ),
+                confidence=np.ones((2, 2), dtype=float),
+            )
+
+            surface = load_gridmap_surface(
+                npz_path,
+                z_by="height",
+                z_source="array:weighted_spline_mean",
+                color_by="height",
+                color_source="array:weighted_spline_residual",
+            )
+
+            available = gridmap_scalar_array_keys(npz_path)
+            self.assertIn("weighted_spline_mean", available)
+            self.assertIn("weighted_spline_residual", available)
+            self.assertEqual(surface.z_source, "array:weighted_spline_mean")
+            self.assertEqual(
+                surface.color_source,
+                "array:weighted_spline_residual",
+            )
+            self.assertEqual(surface.vertices[:, 2].tolist(), [10.0, 20.0, 30.0, 40.0])
+            self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
+            self.assertGreater(surface.colors[-1, 0], surface.colors[-1, 2])
+
+    def test_scalar_grid_source_can_drive_deformation_modes(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            baseline_path = root / "baseline.npz"
+            current_path = root / "current.npz"
+            metadata = {"x_min": 0, "x_max": 2, "y_min": 0, "y_max": 2}
+            np.savez(
+                baseline_path,
+                mean=np.zeros((2, 2), dtype=float),
+                median=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+            )
+            np.savez(
+                current_path,
+                mean=np.zeros((2, 2), dtype=float),
+                median=np.array([[1.5, 1.5], [4.0, 6.0]], dtype=float),
+            )
+            baseline_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            current_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                current_path,
+                z_by="absolute deformation from baseline",
+                z_source="array:median",
+                color_by="deformation from baseline",
+                color_source="array:median",
+                baseline_path=baseline_path,
+            )
+
+            self.assertEqual(surface.z_by, "absolute_deformation")
+            self.assertEqual(surface.z_source, "array:median")
+            self.assertEqual(surface.color_by, "deformation")
+            self.assertEqual(surface.color_source, "array:median")
+            self.assertEqual(surface.vertices[:, 2].tolist(), [0.5, 0.5, 1.0, 2.0])
+
     def test_can_use_deformation_as_z_axis(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td)
@@ -156,6 +433,60 @@ class LoaderTests(unittest.TestCase):
 
             self.assertEqual(surface.z_by, "absolute_deformation")
             self.assertEqual(surface.vertices[:, 2].tolist(), [5.0, 5.0, 10.0, 20.0])
+
+    def test_visual_smoothed_deformation_suppresses_noisy_current_spike(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            baseline_path = root / "baseline.npz"
+            current_path = root / "current.npz"
+            metadata = {"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 3}
+            clean_variance = np.full((3, 3), 0.01, dtype=float)
+            current = np.zeros((3, 3), dtype=float)
+            current[1, 1] = 10.0
+            current_variance = clean_variance.copy()
+            current_variance[1, 1] = 100.0
+            np.savez(
+                baseline_path,
+                mean=np.zeros((3, 3), dtype=float),
+                variance=clean_variance,
+                count=np.ones((3, 3), dtype=float),
+            )
+            np.savez(
+                current_path,
+                mean=current,
+                variance=current_variance,
+                count=np.ones((3, 3), dtype=float),
+            )
+            baseline_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            current_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            z_surface = load_gridmap_surface(
+                current_path,
+                z_by="absolute deformation from baseline",
+                z_source="mean (visual smoothed)",
+                baseline_path=baseline_path,
+            )
+            color_surface = load_gridmap_surface(
+                current_path,
+                color_by="deformation from baseline",
+                color_source="mean (visual smoothed)",
+                color_binary=True,
+                color_threshold=1.0,
+                baseline_path=baseline_path,
+            )
+
+            self.assertEqual(z_surface.z_by, "absolute_deformation")
+            self.assertEqual(z_surface.z_source, "visual_mean")
+            self.assertLess(z_surface.vertices[4, 2], 0.01)
+            self.assertEqual(color_surface.color_by, "deformation")
+            self.assertEqual(color_surface.color_source, "visual_mean")
+            self.assertEqual(color_surface.colors[4].tolist(), [0.08, 0.66, 0.18])
 
     def test_can_colour_by_deformation_from_baseline(self) -> None:
         with TemporaryDirectory() as td:

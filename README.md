@@ -28,13 +28,16 @@ is available.
 The side panel uses expandable sections:
 
 - `Project`: choose selected/stacked view, pick a milestone, or manually refresh
-- `Surface`: choose scanner RGB, height jet gradient, signed deformation, or
-  absolute deformation colouring; optionally switch scalar colouring to binary
+- `Surface`: choose scanner RGB, height, signed deformation, or absolute
+  deformation colouring, then choose the scalar source such as mean, median,
+  variance, visual-smoothed mean, or the processed weighted spline mean and
+  residual when that gridmap exists; optionally switch supported scalar
+  colouring to binary
   red/green with a threshold in millimetres and invert toggle; signed
   deformation gradients can also be inverted to choose whether up or down is
   red; set downsampling
-- `Z Axis`: render actual mean height, signed deformation, absolute deformation,
-  or flat
+- `Z Axis`: choose height, signed deformation, absolute deformation, or flat,
+  then choose the scalar source used by that axis
 - `Section`: optionally limit rendering to an X and/or Y coordinate range
 - `Stack`: choose which raw-gridmap milestones are included and set the
   vertical offset between them in stacked view
@@ -58,6 +61,15 @@ The baseline dropdown defaults to the ALF shared milestone marked with
 `post_bedding_baseline` when that metadata exists. Boundary/material marker
 lines are possible in the Open3D scene, but need a project metadata source or
 manual boundary editor before they can be drawn reliably.
+
+The `Mean (visual smoothed)` source is a display layer, not corrected
+measurement data. It builds visual confidence from the mean cell's `variance`
+and point `count`, uses a local robust median/MAD check to identify uncertain
+spikes, and repairs only those visual outliers from trusted neighbours. Raw
+`Mean` stays untouched for real analysis. If visual smoothing is used for
+deformation, that same confidence-aware outlier pass is applied to the
+deformation view so the comparison is not made from two independently smoothed
+height maps.
 
 ## Open Directly From A File
 
