@@ -273,7 +273,7 @@ class LoaderTests(unittest.TestCase):
             self.assertIn("standard_error", gridmap_scalar_array_keys(npz_path))
             self.assertLess(smoothed.vertices[4, 2], 0.01)
 
-    def test_processed_weighted_spline_gridmap_can_drive_colour_and_z_axis(
+    def test_processed_measurement_confidence_can_drive_colour_and_z_axis(
         self,
     ) -> None:
         with TemporaryDirectory() as td:
@@ -298,34 +298,25 @@ class LoaderTests(unittest.TestCase):
             )
             np.savez(
                 processed_dir
-                / "project_post_bedding_in_1000_weighted_spline_gridmap.npz",
-                mean=np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float),
-                weighted_spline_residual=np.array(
-                    [[0.0, 0.1], [0.2, 0.3]],
-                    dtype=float,
-                ),
-                confidence=np.ones((2, 2), dtype=float),
+                / "project_post_bedding_in_1000_measurement_confidence.npz",
+                confidence=np.array([[0.2, 0.4], [0.6, 0.8]], dtype=float),
+                standard_error=np.array([[4.0, 3.0], [2.0, 1.0]], dtype=float),
             )
 
             surface = load_gridmap_surface(
                 npz_path,
                 z_by="height",
-                z_source="array:weighted_spline_mean",
+                z_source="array:standard_error",
                 color_by="height",
-                color_source="array:weighted_spline_residual",
+                color_source="array:confidence",
             )
-
             available = gridmap_scalar_array_keys(npz_path)
-            self.assertIn("weighted_spline_mean", available)
-            self.assertIn("weighted_spline_residual", available)
-            self.assertEqual(surface.z_source, "array:weighted_spline_mean")
-            self.assertEqual(
-                surface.color_source,
-                "array:weighted_spline_residual",
-            )
-            self.assertEqual(surface.vertices[:, 2].tolist(), [10.0, 20.0, 30.0, 40.0])
-            self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
-            self.assertGreater(surface.colors[-1, 0], surface.colors[-1, 2])
+            self.assertIn("confidence", available)
+            self.assertIn("standard_error", available)
+            self.assertEqual(surface.z_source, "array:standard_error")
+            self.assertEqual(surface.color_source, "array:confidence")
+            self.assertEqual(surface.vertices[:, 2].tolist(), [4.0, 3.0, 2.0, 1.0])
+            self.assertGreater(surface.colors[-1, 0], surface.colors[0, 0])
 
     def test_scalar_grid_source_can_drive_deformation_modes(self) -> None:
         with TemporaryDirectory() as td:
@@ -521,6 +512,29 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual(surface.colors[0].tolist(), [0.08, 0.66, 0.18])
             self.assertEqual(surface.colors[1].tolist(), [0.9, 0.08, 0.06])
 
+    def test_continuous_scalar_threshold_sets_first_red_point(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            json_path = root / "scan.json"
+            np.savez(npz_path, mean=np.array([[0.0, 1.0, 3.0]], dtype=float))
+            json_path.write_text(
+                json.dumps({"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 1}),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                npz_path,
+                color_by="height",
+                color_threshold=1.0,
+            )
+
+            self.assertEqual(surface.color_value_min, 0.0)
+            self.assertEqual(surface.color_value_max, 3.0)
+            self.assertEqual(surface.colors[1].tolist(), surface.colors[2].tolist())
+            self.assertGreater(surface.colors[1, 0], surface.colors[1, 2])
+            self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
+
     def test_can_colour_by_absolute_deformation_from_baseline(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td)
@@ -578,6 +592,73 @@ class LoaderTests(unittest.TestCase):
             self.assertTrue(np.all(surface.colors[:, 2] > surface.colors[:, 0]))
             self.assertTrue(np.all(surface.colors[:, 2] > surface.colors[:, 1]))
 
+    def test_can_colour_by_mean_deformation_by_chainage(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            baseline_path = root / "baseline.npz"
+            current_path = root / "current.npz"
+            metadata = {"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 2}
+            np.savez(baseline_path, mean=np.zeros((2, 3), dtype=float))
+            np.savez(
+                current_path,
+                mean=np.array([[0.0, 1.0, 5.0], [0.0, 3.0, 7.0]], dtype=float),
+            )
+            baseline_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            current_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                current_path,
+                color_by="mean deformation by chainage",
+                baseline_path=baseline_path,
+                z_by="flat",
+            )
+
+            self.assertEqual(surface.color_by, "mean_deformation_by_chainage")
+            self.assertEqual(surface.colors[0].tolist(), surface.colors[3].tolist())
+            self.assertEqual(surface.colors[1].tolist(), surface.colors[4].tolist())
+            self.assertEqual(surface.colors[2].tolist(), surface.colors[5].tolist())
+            self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
+            self.assertGreater(surface.colors[2, 0], surface.colors[2, 2])
+
+    def test_can_colour_by_max_deformation_by_chainage(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            baseline_path = root / "baseline.npz"
+            current_path = root / "current.npz"
+            metadata = {"x_min": 0, "x_max": 2, "y_min": 0, "y_max": 2}
+            np.savez(baseline_path, mean=np.zeros((2, 2), dtype=float))
+            np.savez(
+                current_path,
+                mean=np.array([[0.0, 1.0], [0.0, 4.0]], dtype=float),
+            )
+            baseline_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            current_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                current_path,
+                color_by="max deformation by chainage",
+                baseline_path=baseline_path,
+                z_by="flat",
+            )
+
+            self.assertEqual(surface.color_by, "max_deformation_by_chainage")
+            self.assertEqual(surface.colors[0].tolist(), surface.colors[2].tolist())
+            self.assertEqual(surface.colors[1].tolist(), surface.colors[3].tolist())
+            self.assertGreater(surface.colors[0, 2], surface.colors[0, 0])
+            self.assertGreater(surface.colors[1, 0], surface.colors[1, 2])
+
     def test_can_invert_signed_deformation_gradient(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td)
@@ -611,6 +692,58 @@ class LoaderTests(unittest.TestCase):
             self.assertGreater(normal.colors[1, 0], normal.colors[1, 2])
             self.assertGreater(inverted.colors[0, 0], inverted.colors[0, 2])
             self.assertGreater(inverted.colors[1, 2], inverted.colors[1, 0])
+
+    def test_inverted_continuous_threshold_keeps_low_values_red(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            baseline_path = root / "baseline.npz"
+            current_path = root / "current.npz"
+            metadata = {"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 1}
+            np.savez(baseline_path, mean=np.zeros((1, 3), dtype=float))
+            np.savez(current_path, mean=np.array([[-1.0, 0.0, 2.0]], dtype=float))
+            baseline_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            current_path.with_suffix(".json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                current_path,
+                color_by="deformation",
+                color_threshold=0.0,
+                color_invert=True,
+                baseline_path=baseline_path,
+            )
+
+            self.assertEqual(surface.colors[0].tolist(), surface.colors[1].tolist())
+            self.assertGreater(surface.colors[0, 0], surface.colors[0, 2])
+            self.assertGreater(surface.colors[2, 2], surface.colors[2, 0])
+
+    def test_can_invert_continuous_scalar_red_point(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            npz_path = root / "scan.npz"
+            json_path = root / "scan.json"
+            np.savez(npz_path, mean=np.array([[0.0, 1.0, 3.0]], dtype=float))
+            json_path.write_text(
+                json.dumps({"x_min": 0, "x_max": 3, "y_min": 0, "y_max": 1}),
+                encoding="utf-8",
+            )
+
+            surface = load_gridmap_surface(
+                npz_path,
+                color_by="height",
+                color_threshold=1.0,
+                color_invert=True,
+            )
+
+            self.assertTrue(surface.color_invert)
+            self.assertEqual(surface.colors[0].tolist(), surface.colors[1].tolist())
+            self.assertGreater(surface.colors[0, 0], surface.colors[0, 2])
+            self.assertGreater(surface.colors[2, 2], surface.colors[2, 0])
 
     def test_can_invert_binary_colour_threshold(self) -> None:
         with TemporaryDirectory() as td:

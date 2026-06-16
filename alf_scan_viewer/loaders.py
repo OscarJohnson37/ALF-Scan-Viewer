@@ -52,8 +52,10 @@ class GridmapSurface:
     z_source: str
     z_scale: float
     color_binary: bool = False
-    color_threshold: float = 0.0
+    color_threshold: float | None = None
     color_invert: bool = False
+    color_value_min: float | None = None
+    color_value_max: float | None = None
     x_range: tuple[float | None, float | None] | None = None
     y_range: tuple[float | None, float | None] | None = None
 
@@ -101,9 +103,6 @@ def load_gridmap_data(path: Path) -> GridmapData:
     scalar_grids.update(
         _processed_measurement_scalar_grids(path, expected_shape=mean_grid.shape)
     )
-    scalar_grids.update(
-        _processed_weighted_spline_scalar_grids(path, expected_shape=mean_grid.shape)
-    )
 
     metadata = _normalise_gridmap_metadata(
         json.loads(sidecar_path.read_text(encoding="utf-8")),
@@ -127,7 +126,7 @@ def load_gridmap_surface(
     color_by: str = "rgb",
     color_source: str | None = None,
     color_binary: bool = False,
-    color_threshold: float = 0.0,
+    color_threshold: float | None = None,
     color_invert: bool = False,
     z_by: str = "height",
     z_source: str | None = None,
@@ -164,7 +163,7 @@ def build_gridmap_surface(
     color_by: str = "rgb",
     color_source: str | None = None,
     color_binary: bool = False,
-    color_threshold: float = 0.0,
+    color_threshold: float | None = None,
     color_invert: bool = False,
     z_by: str = "height",
     z_source: str | None = None,
@@ -181,7 +180,7 @@ def build_gridmap_surface(
         color_source,
         fallback=_legacy_color_source(raw_color_by),
     )
-    color_threshold = _normalise_z_scale(color_threshold)
+    color_threshold = _normalise_color_threshold(color_threshold)
     z_by = _normalise_z_by(raw_z_by)
     z_source = _normalise_scalar_source(
         z_source,
@@ -220,7 +219,7 @@ def build_gridmap_surface(
         raise ValueError(f"Gridmap has no finite values for this view: {gridmap.source_path}")
 
     vertices = np.column_stack((xx[valid], yy[valid], z_grid[valid])).astype(float)
-    colors = _grid_colors(
+    colors, color_value_range = _grid_colors(
         rgb_grid,
         gridmap=gridmap,
         downsample_step=downsample_step,
@@ -236,6 +235,9 @@ def build_gridmap_surface(
         baseline_data=baseline_data,
     )
     triangles = _grid_triangles(valid)
+    color_value_min, color_value_max = (None, None)
+    if color_value_range is not None:
+        color_value_min, color_value_max = color_value_range
 
     return GridmapSurface(
         vertices=vertices,
@@ -248,6 +250,8 @@ def build_gridmap_surface(
         color_binary=bool(color_binary),
         color_threshold=color_threshold,
         color_invert=bool(color_invert),
+        color_value_min=color_value_min,
+        color_value_max=color_value_max,
         z_by=z_by,
         z_source=z_source,
         z_scale=z_scale,
@@ -291,6 +295,22 @@ def stack_gridmap_surfaces(
         color_binary=first.color_binary,
         color_threshold=first.color_threshold,
         color_invert=first.color_invert,
+        color_value_min=min(
+            (
+                float(surface.color_value_min)
+                for surface in surfaces
+                if surface.color_value_min is not None
+            ),
+            default=None,
+        ),
+        color_value_max=max(
+            (
+                float(surface.color_value_max)
+                for surface in surfaces
+                if surface.color_value_max is not None
+            ),
+            default=None,
+        ),
         z_by=first.z_by,
         z_source=first.z_source,
         z_scale=first.z_scale,
@@ -304,6 +324,12 @@ def _normalise_downsample_step(value: int) -> int:
         return max(1, int(value))
     except Exception:
         return 1
+
+
+def _normalise_color_threshold(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return _normalise_z_scale(value)
 
 
 def _normalise_color_by(value: str) -> str:
@@ -336,6 +362,18 @@ def _normalise_color_by(value: str) -> str:
         "denoised absolute deformation from baseline": "absolute_deformation",
         "denoised absolute deformation from first scan": "absolute_deformation",
         "denoised_absolute_deformation": "absolute_deformation",
+        "mean deformation by chainage": "mean_deformation_by_chainage",
+        "mean absolute deformation by chainage": "mean_deformation_by_chainage",
+        "chainage mean deformation": "mean_deformation_by_chainage",
+        "chainage mean absolute deformation": "mean_deformation_by_chainage",
+        "max deformation by chainage": "max_deformation_by_chainage",
+        "maximum deformation by chainage": "max_deformation_by_chainage",
+        "max absolute deformation by chainage": "max_deformation_by_chainage",
+        "maximum absolute deformation by chainage": "max_deformation_by_chainage",
+        "chainage max deformation": "max_deformation_by_chainage",
+        "chainage maximum deformation": "max_deformation_by_chainage",
+        "chainage max absolute deformation": "max_deformation_by_chainage",
+        "chainage maximum absolute deformation": "max_deformation_by_chainage",
     }
     if normalised in aliases:
         return aliases[normalised]
@@ -566,44 +604,6 @@ def _processed_measurement_scalar_grids(
     return scalar_grids
 
 
-def _processed_weighted_spline_scalar_grids(
-    raw_gridmap_path: Path, *, expected_shape: tuple[int, int]
-) -> dict[str, np.ndarray]:
-    spline_path = _processed_grid_artifact_path(
-        raw_gridmap_path,
-        pattern="*_weighted_spline_gridmap.npz",
-    )
-    if spline_path is None:
-        return {}
-
-    scalar_grids: dict[str, np.ndarray] = {}
-    try:
-        with np.load(spline_path) as data:
-            spline_mean = _same_shape_numeric_grid(
-                data,
-                key="mean",
-                expected_shape=expected_shape,
-            )
-            spline_residual = _same_shape_numeric_grid(
-                data,
-                key="weighted_spline_residual",
-                expected_shape=expected_shape,
-            )
-    except Exception as exc:
-        warnings.warn(
-            f"Could not read processed weighted spline gridmap '{spline_path}': {exc}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return {}
-
-    if spline_mean is not None:
-        scalar_grids["weighted_spline_mean"] = spline_mean
-    if spline_residual is not None:
-        scalar_grids["weighted_spline_residual"] = spline_residual
-    return scalar_grids
-
-
 def _same_shape_numeric_grid(
     data: Any, *, key: str, expected_shape: tuple[int, int]
 ) -> np.ndarray | None:
@@ -827,6 +827,13 @@ def _source_scalar_grid(gridmap: GridmapData, *, source: str) -> np.ndarray:
 
 def _is_deformation_mode(mode: str) -> bool:
     return mode in {"deformation", "absolute_deformation"}
+
+
+def _is_chainage_deformation_color_mode(mode: str) -> bool:
+    return mode in {
+        "mean_deformation_by_chainage",
+        "max_deformation_by_chainage",
+    }
 
 
 def _gridmap_array(gridmap: GridmapData, key: str) -> np.ndarray:
@@ -1096,27 +1103,85 @@ def _grid_colors(
     color_by: str,
     color_source: str,
     color_binary: bool,
-    color_threshold: float,
+    color_threshold: float | None,
     color_invert: bool,
     x_centres: np.ndarray,
     y_centres: np.ndarray,
     baseline_data: GridmapData | None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, tuple[float, float] | None]:
+    scalar_grid, zero_floor = _color_scalar_grid(
+        gridmap,
+        downsample_step=downsample_step,
+        color_by=color_by,
+        color_source=color_source,
+        valid_mask=valid_mask,
+        x_centres=x_centres,
+        y_centres=y_centres,
+        baseline_data=baseline_data,
+    )
+    if scalar_grid is not None:
+        return (
+            _scalar_colors(
+                scalar_grid,
+                valid_mask=valid_mask,
+                binary=color_binary,
+                threshold=color_threshold,
+                invert=color_invert,
+                zero_floor=zero_floor,
+            ),
+            _scalar_value_range(scalar_grid, valid_mask=valid_mask),
+        )
+
+    return (
+        _rgb_colors(
+            rgb_grid,
+            valid_mask=valid_mask,
+            expected_shape=expected_shape,
+        ),
+        None,
+    )
+
+
+def _color_scalar_grid(
+    gridmap: GridmapData,
+    *,
+    downsample_step: int,
+    color_by: str,
+    color_source: str,
+    valid_mask: np.ndarray,
+    x_centres: np.ndarray,
+    y_centres: np.ndarray,
+    baseline_data: GridmapData | None,
+) -> tuple[np.ndarray | None, bool]:
     if color_by == "height":
-        return _scalar_colors(
+        return (
             _surface_scalar_grid(
                 gridmap,
                 source=color_source,
                 downsample_step=downsample_step,
             ),
-            valid_mask=valid_mask,
-            binary=color_binary,
-            threshold=color_threshold,
-            invert=color_invert,
+            False,
+        )
+
+    if _is_chainage_deformation_color_mode(color_by):
+        return (
+            _chainage_deformation_color_grid(
+                gridmap,
+                statistic="max"
+                if color_by == "max_deformation_by_chainage"
+                else "mean",
+                source=color_source,
+                downsample_step=downsample_step,
+                x_centres=x_centres,
+                y_centres=y_centres,
+                baseline_data=baseline_data,
+                valid_mask=valid_mask,
+            ),
+            True,
         )
 
     if _is_deformation_mode(color_by):
-        return _scalar_colors(
+        return (
             _deformation_grid(
                 gridmap,
                 mode=color_by,
@@ -1127,12 +1192,18 @@ def _grid_colors(
                 baseline_data=baseline_data,
                 error_prefix="Deformation colour mode",
             ),
-            valid_mask=valid_mask,
-            binary=color_binary,
-            threshold=color_threshold,
-            invert=color_invert,
+            color_by == "absolute_deformation",
         )
 
+    return None, False
+
+
+def _rgb_colors(
+    rgb_grid: np.ndarray | None,
+    *,
+    valid_mask: np.ndarray,
+    expected_shape: tuple[int, int],
+) -> np.ndarray:
     default = np.full((int(valid_mask.sum()), 3), 0.78, dtype=float)
     if rgb_grid is None:
         return default
@@ -1160,13 +1231,53 @@ def _grid_colors(
     return np.clip(rgb / scale, 0.0, 1.0)[valid_mask].astype(float)
 
 
+def _chainage_deformation_color_grid(
+    gridmap: GridmapData,
+    *,
+    statistic: str,
+    source: str,
+    downsample_step: int,
+    x_centres: np.ndarray,
+    y_centres: np.ndarray,
+    baseline_data: GridmapData | None,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    deformation = _deformation_grid(
+        gridmap,
+        mode="absolute_deformation",
+        source=source,
+        downsample_step=downsample_step,
+        x_centres=x_centres,
+        y_centres=y_centres,
+        baseline_data=baseline_data,
+        error_prefix="Chainage deformation colour mode",
+    )
+    if deformation.shape != valid_mask.shape:
+        raise ValueError(
+            "Chainage deformation colour mode produced an unexpected grid shape."
+        )
+
+    finite = np.isfinite(deformation) & np.asarray(valid_mask, dtype=bool)
+    column_values = np.full(deformation.shape[1], np.nan, dtype=float)
+    for column_index in range(deformation.shape[1]):
+        values = deformation[:, column_index][finite[:, column_index]]
+        if not values.size:
+            continue
+        if statistic == "max":
+            column_values[column_index] = float(np.nanmax(values))
+        else:
+            column_values[column_index] = float(np.nanmean(values))
+    return np.broadcast_to(column_values[None, :], deformation.shape).astype(float)
+
+
 def _scalar_colors(
     scalar_grid: np.ndarray,
     *,
     valid_mask: np.ndarray,
     binary: bool,
-    threshold: float,
+    threshold: float | None,
     invert: bool,
+    zero_floor: bool = False,
 ) -> np.ndarray:
     values = np.asarray(scalar_grid, dtype=float)[valid_mask]
     if values.size == 0:
@@ -1179,7 +1290,7 @@ def _scalar_colors(
 
     finite_values = values[finite]
     if binary:
-        above = finite_values > float(threshold)
+        above = finite_values > float(0.0 if threshold is None else threshold)
         if invert:
             above = ~above
         colors[finite] = np.where(
@@ -1189,17 +1300,59 @@ def _scalar_colors(
         )
         return colors
 
-    low = float(np.nanmin(finite_values))
-    high = float(np.nanmax(finite_values))
-    if np.isclose(high, low):
-        t = np.zeros(finite_values.shape, dtype=float)
-    else:
-        t = np.clip((finite_values - low) / (high - low), 0.0, 1.0)
-    if invert:
-        t = 1.0 - t
+    low, high = _scalar_color_bounds(
+        finite_values,
+        zero_floor=zero_floor,
+    )
+    if threshold is None:
+        if np.isclose(high, low):
+            t = np.zeros(finite_values.shape, dtype=float)
+        else:
+            t = np.clip((finite_values - low) / (high - low), 0.0, 1.0)
+        if invert:
+            t = 1.0 - t
+        colors[finite] = _jet_colors(t)
+        return colors.astype(float)
 
+    threshold = float(np.clip(threshold, low, high))
+    if invert:
+        if np.isclose(high, threshold):
+            t = np.ones(finite_values.shape, dtype=float)
+        else:
+            clipped = np.maximum(finite_values, threshold)
+            t = np.clip((clipped - threshold) / (high - threshold), 0.0, 1.0)
+            t = 1.0 - t
+    elif np.isclose(threshold, low):
+        t = np.ones(finite_values.shape, dtype=float)
+    else:
+        clipped = np.minimum(finite_values, threshold)
+        t = np.clip((clipped - low) / (threshold - low), 0.0, 1.0)
     colors[finite] = _jet_colors(t)
     return colors.astype(float)
+
+
+def _scalar_value_range(
+    scalar_grid: np.ndarray,
+    *,
+    valid_mask: np.ndarray,
+) -> tuple[float, float] | None:
+    values = np.asarray(scalar_grid, dtype=float)[valid_mask]
+    finite_values = values[np.isfinite(values)]
+    if not finite_values.size:
+        return None
+    return float(np.nanmin(finite_values)), float(np.nanmax(finite_values))
+
+
+def _scalar_color_bounds(
+    finite_values: np.ndarray,
+    *,
+    zero_floor: bool,
+) -> tuple[float, float]:
+    low = float(np.nanmin(finite_values))
+    high = float(np.nanmax(finite_values))
+    if zero_floor and high >= 0.0:
+        low = min(0.0, low)
+    return low, high
 
 
 def _jet_colors(t: np.ndarray) -> np.ndarray:

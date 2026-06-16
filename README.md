@@ -30,12 +30,12 @@ The side panel uses expandable sections:
 - `Project`: choose selected/stacked view, pick a milestone, or manually refresh
 - `Surface`: choose scanner RGB, height, signed deformation, or absolute
   deformation colouring, then choose the scalar source such as mean, median,
-  variance, visual-smoothed mean, or the processed weighted spline mean and
-  residual when that gridmap exists; optionally switch supported scalar
-  colouring to binary
-  red/green with a threshold in millimetres and invert toggle; signed
-  deformation gradients can also be inverted to choose whether up or down is
-  red; set downsampling
+  variance, confidence, standard error, or visual-smoothed mean; optionally
+  switch supported scalar colouring to binary red/green with a threshold in
+  millimetres, or keep the continuous heatmap and choose the scalar value where
+  red begins; the threshold controls track the current scalar min/max range, and
+  invert can flip supported scalar modes so values below the chosen point stay
+  red instead; set downsampling
 - `Z Axis`: choose height, signed deformation, absolute deformation, or flat,
   then choose the scalar source used by that axis
 - `Section`: optionally limit rendering to an X and/or Y coordinate range

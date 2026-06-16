@@ -29,11 +29,15 @@ from .project import (
 
 MAX_STACK_VERTICES = 1_500_000
 MAX_STACK_TRIANGLES = 5_000_000
+COLOR_THRESHOLD_DEFAULT_RANGE_MM = (-20.0, 100.0)
+COLOR_THRESHOLD_MIN_SPAN_MM = 1e-6
 COLOR_MODE_CHOICES = (
     ("RGB", "rgb"),
     ("Height", "height"),
     ("Deformation From Baseline", "deformation"),
     ("Absolute Deformation From Baseline", "absolute_deformation"),
+    ("Mean Deformation By Chainage", "mean_deformation_by_chainage"),
+    ("Max Deformation By Chainage", "max_deformation_by_chainage"),
 )
 Z_MODE_CHOICES = (
     ("Height", "height"),
@@ -112,20 +116,30 @@ class ViewerApp:
         self.color_binary_checkbox = self.gui.Checkbox("Binary red/green")
         self.color_binary_checkbox.set_on_checked(self._color_binary_changed)
 
+        default_threshold_low_mm, default_threshold_high_mm = (
+            COLOR_THRESHOLD_DEFAULT_RANGE_MM
+        )
         self.color_threshold_slider = self.gui.Slider(self.gui.Slider.DOUBLE)
-        self.color_threshold_slider.set_limits(-20.0, 100.0)
-        self.color_threshold_slider.double_value = 0.0
+        self.color_threshold_slider.set_limits(
+            0.0,
+            default_threshold_high_mm - default_threshold_low_mm,
+        )
+        self.color_threshold_slider.double_value = default_threshold_high_mm
         self.color_threshold_slider.set_on_value_changed(
             self._color_threshold_slider_changed
         )
 
         self.color_threshold_input = self.gui.NumberEdit(self.gui.NumberEdit.DOUBLE)
-        self.color_threshold_input.set_limits(-20.0, 100.0)
+        self.color_threshold_input.set_limits(
+            default_threshold_low_mm,
+            default_threshold_high_mm,
+        )
         self.color_threshold_input.set_value(0.0)
         self.color_threshold_input.set_preferred_width(90)
         self.color_threshold_input.set_on_value_changed(
             self._color_threshold_input_changed
         )
+        self.color_threshold_label = self.gui.Label("Threshold (mm)")
 
         self.color_invert_checkbox = self.gui.Checkbox("Invert colours")
         self.color_invert_checkbox.set_on_checked(self._color_binary_changed)
@@ -231,6 +245,9 @@ class ViewerApp:
         self._stack_surface_cache: list[tuple[MilestoneScan, Any]] = []
         self._stack_cache_signature: tuple[Any, ...] | None = None
         self._grid_array_keys: list[str] = []
+        self._color_threshold_range_mm = COLOR_THRESHOLD_DEFAULT_RANGE_MM
+        self._color_threshold_auto = True
+        self._color_threshold_mode_state = "rgb"
         self._current_scene_bounds: Any | None = None
         self._scene_has_geometry = False
 
@@ -263,7 +280,7 @@ class ViewerApp:
             em,
         )
         surface_section.add_child(self.color_binary_checkbox)
-        surface_section.add_child(self.gui.Label("Threshold (mm)"))
+        surface_section.add_child(self.color_threshold_label)
         threshold_row = self.gui.Horiz(0.4 * em)
         threshold_row.add_child(self.color_threshold_slider)
         threshold_row.add_child(self.color_threshold_input)
@@ -410,6 +427,7 @@ class ViewerApp:
             self._render_requested_view()
 
     def _surface_option_changed(self, _text: str, _index: int) -> None:
+        self._handle_color_threshold_mode_transition()
         self._update_view_controls()
         self._clear_stack_cache()
         self._auto_render_view()
@@ -419,6 +437,7 @@ class ViewerApp:
         self._auto_render_view()
 
     def _color_binary_changed(self, _checked: bool) -> None:
+        self._handle_color_threshold_mode_transition()
         self._update_view_controls()
         self._clear_stack_cache()
         self._auto_render_view()
@@ -426,23 +445,29 @@ class ViewerApp:
     def _color_threshold_slider_changed(self, value: float) -> None:
         if self._syncing_color_threshold:
             return
+        value_mm = self._color_threshold_mm_from_slider_value(value)
         self._syncing_color_threshold = True
         try:
-            self.color_threshold_input.set_value(float(value))
+            self.color_threshold_input.set_value(value_mm)
         finally:
             self._syncing_color_threshold = False
+        self._color_threshold_auto = False
         self._clear_stack_cache()
         self._auto_render_view()
 
     def _color_threshold_input_changed(self, value: float) -> None:
         if self._syncing_color_threshold:
             return
-        value = float(value)
+        value_mm = self._clamp_color_threshold_mm(float(value))
         self._syncing_color_threshold = True
         try:
-            self.color_threshold_slider.double_value = min(max(value, -20.0), 100.0)
+            self.color_threshold_input.set_value(value_mm)
+            self.color_threshold_slider.double_value = (
+                self._color_threshold_slider_value_for_mm(value_mm)
+            )
         finally:
             self._syncing_color_threshold = False
+        self._color_threshold_auto = False
         self._clear_stack_cache()
         self._auto_render_view()
 
@@ -579,16 +604,14 @@ class ViewerApp:
                 keys.append(key)
 
         preferred_order = {
-            "weighted_spline_mean": 0,
-            "weighted_spline_residual": 1,
-            "median": 2,
-            "mode": 3,
-            "variance": 4,
-            "count": 5,
-            "confidence": 6,
-            "standard_error": 7,
-            "mean_variance": 8,
-            "precision_weight": 9,
+            "median": 0,
+            "mode": 1,
+            "variance": 2,
+            "count": 3,
+            "confidence": 4,
+            "standard_error": 5,
+            "mean_variance": 6,
+            "precision_weight": 7,
         }
         keys.sort(key=lambda key: (preferred_order.get(key.lower(), 99), key.lower()))
         if keys == self._grid_array_keys:
@@ -789,20 +812,9 @@ class ViewerApp:
             return
 
         try:
-            surface = load_gridmap_surface(
+            surface = self._load_gridmap_surface_with_threshold_sync(
                 scan.raw_gridmap_path,
-                downsample_step=self._downsample_step(),
-                color_by=self._color_by(),
-                color_source=self._color_source(),
-                color_binary=self._color_binary(),
-                color_threshold=self._color_threshold(),
-                color_invert=self._color_invert(),
-                z_by=self._z_by(),
-                z_source=self._z_source(),
-                z_scale=self._z_scale(),
                 baseline_path=self._baseline_gridmap_path(scan),
-                x_range=self._x_range(),
-                y_range=self._y_range(),
             )
             geometry = self._gridmap_surface_to_mesh(surface)
             material = self.mesh_material if self._is_mesh(geometry) else self.material
@@ -837,31 +849,18 @@ class ViewerApp:
             return
 
         baseline_path = self._baseline_gridmap_path()
-        surfaces: list[tuple[MilestoneScan, Any]] = []
-        failures: list[str] = []
-
-        for scan in scans:
-            if scan.raw_gridmap_path is None:
-                continue
-            try:
-                surface = load_gridmap_surface(
-                    scan.raw_gridmap_path,
-                    downsample_step=self._downsample_step(),
-                    color_by=self._color_by(),
-                    color_source=self._color_source(),
-                    color_binary=self._color_binary(),
-                    color_threshold=self._color_threshold(),
-                    color_invert=self._color_invert(),
-                    z_by=self._z_by(),
-                    z_source=self._z_source(),
-                    z_scale=self._z_scale(),
-                    baseline_path=baseline_path,
-                    x_range=self._x_range(),
-                    y_range=self._y_range(),
-                )
-                surfaces.append((scan, surface))
-            except Exception as exc:
-                failures.append(f"{scan.label}: {exc}")
+        surfaces, failures = self._load_stack_surface_pass(
+            scans,
+            baseline_path=baseline_path,
+        )
+        if surfaces and self._sync_color_threshold_range_from_surfaces(
+            [surface for _, surface in surfaces]
+        ):
+            surfaces, failures = self._load_stack_surface_pass(
+                scans,
+                baseline_path=baseline_path,
+            )
+            cache_signature = self._stack_surface_cache_signature(scans)
 
         if not surfaces:
             message = "Could not render any stack surfaces."
@@ -929,6 +928,59 @@ class ViewerApp:
         elif self._selected_stack_scans():
             self._generate_stack_surface()
 
+    def _load_gridmap_surface(self, path: Path, *, baseline_path: Path | None) -> Any:
+        return load_gridmap_surface(
+            path,
+            downsample_step=self._downsample_step(),
+            color_by=self._color_by(),
+            color_source=self._color_source(),
+            color_binary=self._color_binary(),
+            color_threshold=self._color_threshold(),
+            color_invert=self._color_invert(),
+            z_by=self._z_by(),
+            z_source=self._z_source(),
+            z_scale=self._z_scale(),
+            baseline_path=baseline_path,
+            x_range=self._x_range(),
+            y_range=self._y_range(),
+        )
+
+    def _load_gridmap_surface_with_threshold_sync(
+        self,
+        path: Path,
+        *,
+        baseline_path: Path | None,
+    ) -> Any:
+        surface = self._load_gridmap_surface(path, baseline_path=baseline_path)
+        if self._sync_color_threshold_range_from_surfaces([surface]):
+            surface = self._load_gridmap_surface(path, baseline_path=baseline_path)
+        return surface
+
+    def _load_stack_surface_pass(
+        self,
+        scans: list[MilestoneScan],
+        *,
+        baseline_path: Path | None,
+    ) -> tuple[list[tuple[MilestoneScan, Any]], list[str]]:
+        surfaces: list[tuple[MilestoneScan, Any]] = []
+        failures: list[str] = []
+        for scan in scans:
+            if scan.raw_gridmap_path is None:
+                continue
+            try:
+                surfaces.append(
+                    (
+                        scan,
+                        self._load_gridmap_surface(
+                            scan.raw_gridmap_path,
+                            baseline_path=baseline_path,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                failures.append(f"{scan.label}: {exc}")
+        return surfaces, failures
+
     def load_file(self, path: Path, *, label_prefix: str | None = None) -> None:
         try:
             self._set_loaded_project_context(path)
@@ -952,20 +1004,9 @@ class ViewerApp:
             self._show_error("Could not open file", str(exc))
 
     def _load_gridmap(self, path: Path) -> Any:
-        surface = load_gridmap_surface(
+        surface = self._load_gridmap_surface_with_threshold_sync(
             path,
-            downsample_step=self._downsample_step(),
-            color_by=self._color_by(),
-            color_source=self._color_source(),
-            color_binary=self._color_binary(),
-            color_threshold=self._color_threshold(),
-            color_invert=self._color_invert(),
-            z_by=self._z_by(),
-            z_source=self._z_source(),
-            z_scale=self._z_scale(),
             baseline_path=path if self._uses_baseline() else None,
-            x_range=self._x_range(),
-            y_range=self._y_range(),
         )
         return self._gridmap_surface_to_mesh(surface)
 
@@ -1208,16 +1249,19 @@ class ViewerApp:
         binary_colour = binary_colour_supported and bool(
             self.color_binary_checkbox.checked
         )
-        signed_deformation_gradient = color_by == "deformation" and not binary_colour
         self.milestone_combo.enabled = bool(self._milestone_scans)
         self.baseline_combo.enabled = bool(self._baseline_scans())
         self.color_source_combo.enabled = color_by != "rgb"
         self.z_source_combo.enabled = self._z_by() != "flat"
         self.color_binary_checkbox.enabled = binary_colour_supported
-        threshold_enabled = binary_colour_supported and binary_colour
+        threshold_enabled = binary_colour_supported
         self.color_threshold_slider.enabled = threshold_enabled
         self.color_threshold_input.enabled = threshold_enabled
-        self.color_invert_checkbox.enabled = threshold_enabled or signed_deformation_gradient
+        self.color_threshold_label.text = self._color_threshold_label_text(
+            color_by=color_by,
+            binary_colour=binary_colour,
+        )
+        self.color_invert_checkbox.enabled = binary_colour_supported
         self.x_min_input.enabled = bool(self.limit_x_checkbox.checked)
         self.x_max_input.enabled = bool(self.limit_x_checkbox.checked)
         self.y_min_input.enabled = bool(self.limit_y_checkbox.checked)
@@ -1243,6 +1287,74 @@ class ViewerApp:
             self.generate_button.enabled = bool(self._selected_stack_scans())
         else:
             self.generate_button.enabled = current.can_generate_surface if current else False
+
+    @staticmethod
+    def _color_threshold_label_text(*, color_by: str, binary_colour: bool) -> str:
+        if color_by == "rgb":
+            return "Threshold (mm)"
+        if binary_colour:
+            return "Binary Threshold (mm)"
+        return "Red Point (mm)"
+
+    def _handle_color_threshold_mode_transition(self) -> None:
+        mode = self._color_threshold_mode()
+        if mode == self._color_threshold_mode_state:
+            return
+        if mode == "continuous":
+            self._color_threshold_auto = True
+        elif mode == "binary":
+            self._set_color_threshold_mm(0.0, auto=False)
+        self._color_threshold_mode_state = mode
+
+    def _color_threshold_mode(self) -> str:
+        if self._color_by() == "rgb":
+            return "rgb"
+        if self._color_binary():
+            return "binary"
+        return "continuous"
+
+    def _sync_color_threshold_range_from_surfaces(self, surfaces: list[Any]) -> bool:
+        low_mm, high_mm = COLOR_THRESHOLD_DEFAULT_RANGE_MM
+        mins = [
+            float(surface.color_value_min) * 1000.0
+            for surface in surfaces
+            if getattr(surface, "color_value_min", None) is not None
+        ]
+        maxs = [
+            float(surface.color_value_max) * 1000.0
+            for surface in surfaces
+            if getattr(surface, "color_value_max", None) is not None
+        ]
+        if mins and maxs:
+            low_mm = min(mins)
+            high_mm = max(maxs)
+        if high_mm < low_mm:
+            low_mm, high_mm = high_mm, low_mm
+
+        self._color_threshold_range_mm = (low_mm, high_mm)
+        input_high_mm = high_mm if high_mm > low_mm else low_mm + 1e-6
+        self.color_threshold_input.set_limits(low_mm, input_high_mm)
+        self.color_threshold_slider.set_limits(
+            0.0,
+            max(high_mm - low_mm, COLOR_THRESHOLD_MIN_SPAN_MM),
+        )
+
+        current_value_mm = self._color_threshold_mm_value()
+        desired_value_mm = current_value_mm
+        auto_value = self._color_threshold_auto
+        if self._color_threshold_mode() == "continuous":
+            if self._color_threshold_auto or current_value_mm < low_mm or current_value_mm > high_mm:
+                desired_value_mm = self._default_continuous_threshold_mm(low_mm, high_mm)
+                auto_value = True
+            else:
+                desired_value_mm = self._clamp_color_threshold_mm(current_value_mm)
+                auto_value = False
+        else:
+            desired_value_mm = self._clamp_color_threshold_mm(current_value_mm)
+            if self._color_threshold_mode() == "binary":
+                auto_value = False
+
+        return self._set_color_threshold_mm(desired_value_mm, auto=auto_value)
 
     def _clear_stack_cache(self) -> None:
         self._stack_surface_cache = []
@@ -1310,18 +1422,58 @@ class ViewerApp:
     def _color_binary(self) -> bool:
         return self._color_by() != "rgb" and bool(self.color_binary_checkbox.checked)
 
-    def _color_threshold(self) -> float:
+    def _color_threshold_mm_value(self) -> float:
         try:
-            return float(self.color_threshold_input.double_value) / 1000.0
+            return float(self.color_threshold_input.double_value)
         except Exception:
             return 0.0
+
+    def _color_threshold(self) -> float:
+        return self._color_threshold_mm_value() / 1000.0
+
+    def _clamp_color_threshold_mm(self, value_mm: float) -> float:
+        low_mm, high_mm = self._color_threshold_range_mm
+        return min(max(float(value_mm), low_mm), high_mm)
+
+    def _color_threshold_slider_value_for_mm(self, value_mm: float) -> float:
+        _low_mm, high_mm = self._color_threshold_range_mm
+        return high_mm - self._clamp_color_threshold_mm(value_mm)
+
+    def _color_threshold_mm_from_slider_value(self, slider_value: float) -> float:
+        low_mm, high_mm = self._color_threshold_range_mm
+        span_mm = max(high_mm - low_mm, COLOR_THRESHOLD_MIN_SPAN_MM)
+        offset_mm = min(max(float(slider_value), 0.0), span_mm)
+        return self._clamp_color_threshold_mm(high_mm - offset_mm)
+
+    def _default_continuous_threshold_mm(self, low_mm: float, high_mm: float) -> float:
+        if self._color_invert():
+            return low_mm
+        return high_mm
+
+    def _set_color_threshold_mm(
+        self,
+        value_mm: float,
+        *,
+        auto: bool | None = None,
+    ) -> bool:
+        clamped_value_mm = self._clamp_color_threshold_mm(value_mm)
+        current_value_mm = self._color_threshold_mm_value()
+        self._syncing_color_threshold = True
+        try:
+            self.color_threshold_input.set_value(clamped_value_mm)
+            self.color_threshold_slider.double_value = (
+                self._color_threshold_slider_value_for_mm(clamped_value_mm)
+            )
+        finally:
+            self._syncing_color_threshold = False
+        if auto is not None:
+            self._color_threshold_auto = auto
+        return abs(current_value_mm - clamped_value_mm) > 1e-9
 
     def _color_invert(self) -> bool:
         if not bool(self.color_invert_checkbox.checked):
             return False
-        if self._color_binary():
-            return True
-        return self._color_by() == "deformation"
+        return self._color_by() != "rgb"
 
     def _z_by(self) -> str:
         value = str(self.z_combo.selected_text or "Height").strip()
@@ -1376,7 +1528,12 @@ class ViewerApp:
         return default_baseline_scan(self._milestone_scans)
 
     def _uses_baseline(self) -> bool:
-        deformation_modes = {"deformation", "absolute_deformation"}
+        deformation_modes = {
+            "deformation",
+            "absolute_deformation",
+            "mean_deformation_by_chainage",
+            "max_deformation_by_chainage",
+        }
         return self._z_by() in deformation_modes or self._color_by() in deformation_modes
 
     @staticmethod
@@ -1386,6 +1543,8 @@ class ViewerApp:
             "height": "height",
             "deformation": "signed deformation",
             "absolute_deformation": "absolute deformation",
+            "mean_deformation_by_chainage": "mean deformation by chainage",
+            "max_deformation_by_chainage": "max deformation by chainage",
             "flat": "flat",
         }
         return labels.get(mode, mode)
